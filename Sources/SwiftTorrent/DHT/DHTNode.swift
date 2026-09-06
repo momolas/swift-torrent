@@ -34,13 +34,30 @@ public actor DHTNode {
         let handler = DHTResponseHandler()
         self.responseHandler = handler
 
-        self.channel = try await DatagramBootstrap(group: group)
-            .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
-            .channelInitializer { channel in
-                channel.pipeline.addHandler(handler)
+        var boundChannel: Channel?
+        var lastError: Error?
+        let portsToTry = [port, port + 1, port + 2, port + 3, 0]
+        for p in portsToTry {
+            do {
+                let chan = try await DatagramBootstrap(group: group)
+                    .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
+                    .channelOption(ChannelOptions.socketOption(.so_reuseport), value: 1)
+                    .channelInitializer { channel in
+                        channel.pipeline.addHandler(handler)
+                    }
+                    .bind(host: "0.0.0.0", port: p)
+                    .get()
+                boundChannel = chan
+                break
+            } catch {
+                lastError = error
             }
-            .bind(host: "0.0.0.0", port: port)
-            .get()
+        }
+
+        guard let ch = boundChannel else {
+            throw lastError ?? NIOCore.IOError(errnoCode: 1, reason: "Unable to bind DHT port")
+        }
+        self.channel = ch
 
         handler.onMessage = { [weak self] message, address, port in
             guard let self else { return }
