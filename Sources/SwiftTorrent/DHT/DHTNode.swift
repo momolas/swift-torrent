@@ -41,7 +41,6 @@ public actor DHTNode {
             do {
                 let chan = try await DatagramBootstrap(group: group)
                     .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
-                    .channelOption(ChannelOptions.socketOption(.so_reuseport), value: 1)
                     .channelInitializer { channel in
                         channel.pipeline.addHandler(handler)
                     }
