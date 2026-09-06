@@ -2,7 +2,8 @@ import Foundation
 import Crypto
 
 /// Represents a parsed .torrent file.
-public struct TorrentInfo: Sendable {
+public struct TorrentInfo: Sendable, Identifiable, Equatable, Hashable {
+    public var id: InfoHash { infoHash }
     public let infoHash: InfoHash
     public let name: String
     public let pieceLength: Int
@@ -17,7 +18,8 @@ public struct TorrentInfo: Sendable {
     public let announceList: [[String]]
 
     /// A single file within the torrent.
-    public struct FileEntry: Sendable {
+    public struct FileEntry: Sendable, Identifiable, Equatable, Hashable {
+        public var id: String { path }
         public let path: String
         public let length: Int64
         public let offset: Int64  // byte offset within the torrent data

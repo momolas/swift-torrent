@@ -1,7 +1,7 @@
 import Foundation
 
 /// A compact bit array backed by `[UInt64]` for tracking piece availability.
-public struct Bitfield: Sendable, Equatable {
+public struct Bitfield: Sendable, Equatable, Hashable {
     public private(set) var storage: [UInt64]
     public let count: Int
 

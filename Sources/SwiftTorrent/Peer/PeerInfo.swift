@@ -1,7 +1,7 @@
 import Foundation
 
 /// Information about a connected peer.
-public struct PeerInfo: Sendable, Identifiable {
+public struct PeerInfo: Sendable, Identifiable, Equatable, Hashable {
     public let id: Data          // 20-byte peer ID
     public let address: String
     public let port: UInt16

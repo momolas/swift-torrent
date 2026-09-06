@@ -3,6 +3,7 @@ import Foundation
 // MARK: - Status Alerts
 
 public struct TorrentAddedAlert: Alert {
+    public let id = UUID()
     public let timestamp = Date()
     public let category = AlertCategory.status
     public let infoHash: InfoHash
@@ -10,18 +11,21 @@ public struct TorrentAddedAlert: Alert {
 }
 
 public struct TorrentRemovedAlert: Alert {
+    public let id = UUID()
     public let timestamp = Date()
     public let category = AlertCategory.status
     public let infoHash: InfoHash
 }
 
 public struct TorrentFinishedAlert: Alert {
+    public let id = UUID()
     public let timestamp = Date()
     public let category = AlertCategory.status
     public let infoHash: InfoHash
 }
 
 public struct StateChangedAlert: Alert {
+    public let id = UUID()
     public let timestamp = Date()
     public let category = AlertCategory.status
     public let infoHash: InfoHash
@@ -32,6 +36,7 @@ public struct StateChangedAlert: Alert {
 // MARK: - Peer Alerts
 
 public struct PeerConnectedAlert: Alert {
+    public let id = UUID()
     public let timestamp = Date()
     public let category = AlertCategory.peer
     public let address: String
@@ -39,6 +44,7 @@ public struct PeerConnectedAlert: Alert {
 }
 
 public struct PeerDisconnectedAlert: Alert {
+    public let id = UUID()
     public let timestamp = Date()
     public let category = AlertCategory.peer
     public let address: String
@@ -49,6 +55,7 @@ public struct PeerDisconnectedAlert: Alert {
 // MARK: - Tracker Alerts
 
 public struct TrackerResponseAlert: Alert {
+    public let id = UUID()
     public let timestamp = Date()
     public let category = AlertCategory.tracker
     public let url: String
@@ -56,6 +63,7 @@ public struct TrackerResponseAlert: Alert {
 }
 
 public struct TrackerErrorAlert: Alert {
+    public let id = UUID()
     public let timestamp = Date()
     public let category = AlertCategory.error
     public let url: String
@@ -65,12 +73,14 @@ public struct TrackerErrorAlert: Alert {
 // MARK: - Storage Alerts
 
 public struct PieceFinishedAlert: Alert {
+    public let id = UUID()
     public let timestamp = Date()
     public let category = AlertCategory.storage
     public let pieceIndex: Int
 }
 
 public struct HashFailedAlert: Alert {
+    public let id = UUID()
     public let timestamp = Date()
     public let category = AlertCategory.storage
     public let pieceIndex: Int
@@ -79,6 +89,7 @@ public struct HashFailedAlert: Alert {
 // MARK: - Error Alerts
 
 public struct FileErrorAlert: Alert {
+    public let id = UUID()
     public let timestamp = Date()
     public let category = AlertCategory.error
     public let path: String

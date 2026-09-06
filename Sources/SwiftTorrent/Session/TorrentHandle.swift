@@ -228,13 +228,39 @@ public actor TorrentHandle {
         max(0, (info?.totalSize ?? 0) - totalDownloaded)
     }
 
-    /// Pause the torrent.
-    public func pause() {
+    /// Pause the torrent and disconnect all active peer sockets.
+    public func pause() async {
         state = .paused
         downloadRate = 0
         uploadRate = 0
         reannounceTask?.cancel()
         downloadMonitorTask?.cancel()
+        reannounceTask = nil
+        downloadMonitorTask = nil
+        await peerManager.disconnectAll()
+    }
+
+    /// Stop the torrent and cleanup resources.
+    public func stop() async {
+        await pause()
+        state = .stopped
+    }
+
+    /// Real-time stream of status updates for SwiftUI.
+    public func statusStream(interval: TimeInterval = 1.0) -> AsyncStream<TorrentStatus> {
+        AsyncStream { continuation in
+            let task = Task {
+                while !Task.isCancelled {
+                    let st = await self.status()
+                    continuation.yield(st)
+                    try? await Task.sleep(for: .seconds(interval))
+                }
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in
+                task.cancel()
+            }
+        }
     }
 
     /// Resume the torrent.
@@ -269,6 +295,16 @@ public actor TorrentHandle {
             piecesCompleted: completed?.popcount ?? 0,
             piecesTotal: info?.pieceCount ?? 0
         )
+    }
+
+    /// Returns connected peers for UI inspection.
+    public func getPeers() async -> [PeerInfo] {
+        await peerManager.getPeers()
+    }
+
+    /// Returns the completed pieces bitfield for UI piece grid inspection.
+    public func getBitfield() async -> Bitfield? {
+        await pieceManager?.getCompleted()
     }
 
     /// Returns the file entries for this torrent, or nil if metadata is not yet available.

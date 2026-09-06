@@ -1,7 +1,8 @@
 import Foundation
 
 /// Base protocol for all alert types.
-public protocol Alert: Sendable {
+public protocol Alert: Sendable, Identifiable {
+    var id: UUID { get }
     var timestamp: Date { get }
     var category: AlertCategory { get }
 }

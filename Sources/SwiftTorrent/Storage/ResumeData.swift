@@ -1,7 +1,7 @@
 import Foundation
 
 /// Save and restore torrent state via bencoding.
-public struct ResumeData: Sendable {
+public struct ResumeData: Sendable, Equatable, Hashable {
     public let infoHash: InfoHash
     public let completedPieces: Bitfield
     public let uploaded: Int64

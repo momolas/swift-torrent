@@ -23,6 +23,11 @@ public actor DiskIO {
         try? threadPool.syncShutdownGracefully()
     }
 
+    /// Explicitly shutdown thread pool.
+    public func shutdown() async {
+        try? threadPool.syncShutdownGracefully()
+    }
+
     private func resolvedPath(for slicePath: String) throws -> String {
         let baseStandardized = URL(fileURLWithPath: basePath).standardizedFileURL.path
         let combined = (basePath as NSString).appendingPathComponent(slicePath)

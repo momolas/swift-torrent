@@ -7,6 +7,7 @@ public actor TrackerManager {
     private let group: EventLoopGroup
     private var lastResponse: AnnounceResponse?
     private var announceInterval: Int = 1800
+    public var isBlocked: (@Sendable (String) -> Bool)?
 
     public init(tiers: [[String]], group: EventLoopGroup) {
         self.tiers = tiers
@@ -27,6 +28,9 @@ public actor TrackerManager {
     public func announce(params: AnnounceParams) async throws -> AnnounceResponse {
         for tier in tiers {
             for urlString in tier {
+                if let isBlocked, isBlocked(urlString) {
+                    continue
+                }
                 do {
                     let response: AnnounceResponse
                     if urlString.hasPrefix("http://") || urlString.hasPrefix("https://") {

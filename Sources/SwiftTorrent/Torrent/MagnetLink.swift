@@ -1,7 +1,7 @@
 import Foundation
 
 /// Parses and generates magnet URIs (BEP-9).
-public struct MagnetLink: Sendable {
+public struct MagnetLink: Sendable, Equatable, Hashable {
     public let infoHash: InfoHash
     public let displayName: String?
     public let trackers: [String]

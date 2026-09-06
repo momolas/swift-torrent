@@ -57,3 +57,25 @@ public struct InfoHash: Hashable, Sendable, CustomStringConvertible {
         }.joined()
     }
 }
+
+
+// MARK: - Identifiable & Codable
+extension InfoHash: Identifiable {
+    public var id: String { description }
+}
+
+extension InfoHash: Codable {
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let hex = try container.decode(String.self)
+        guard let hash = InfoHash(hex: hex) else {
+            throw DecodingError.dataCorruptedError(in: container, debugDescription: "Invalid info hash hex string: \(hex)")
+        }
+        self = hash
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(description)
+    }
+}

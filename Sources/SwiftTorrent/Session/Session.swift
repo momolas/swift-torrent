@@ -109,6 +109,23 @@ public actor Session {
         }
     }
 
+    /// Real-time stream of all torrent statuses for SwiftUI and reactive observers.
+    public func statusStream(interval: TimeInterval = 1.0) -> AsyncStream<[TorrentStatus]> {
+        AsyncStream { continuation in
+            let task = Task {
+                while !Task.isCancelled {
+                    let statuses = await self.allStatus()
+                    continuation.yield(statuses)
+                    try? await Task.sleep(for: .seconds(interval))
+                }
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in
+                task.cancel()
+            }
+        }
+    }
+
     /// Shutdown the session.
     public func shutdown() async throws {
         await pauseAll()

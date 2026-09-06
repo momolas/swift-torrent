@@ -297,6 +297,11 @@ public actor PeerManager {
     }
 
     /// Number of active connections.
+    /// Returns snapshot of all currently known peers.
+    public func getPeers() -> [PeerInfo] {
+        Array(peerInfos.values)
+    }
+
     public var connectionCount: Int {
         connections.count
     }
@@ -335,5 +340,16 @@ public actor PeerManager {
                 await fillRequests(for: key)
             }
         }
+    }
+
+    /// Disconnect all active peers and release resources.
+    public func disconnectAll() async {
+        for conn in connections.values {
+            try? await conn.close()
+        }
+        connections.removeAll()
+        peerInfos.removeAll()
+        peerStates.removeAll()
+        connectedPeers.removeAll()
     }
 }
