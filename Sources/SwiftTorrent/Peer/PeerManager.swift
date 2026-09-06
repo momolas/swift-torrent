@@ -44,6 +44,10 @@ public actor PeerManager {
         self.onMetadataReceived = handler
     }
 
+    public func setOnPieceCompleted(_ handler: @escaping (Int) -> Void) {
+        self.onPieceCompleted = handler
+    }
+
     /// Add a peer and attempt connection.
     public func addPeer(address: String, port: UInt16) async {
         let key = "\(address):\(port)"
@@ -80,9 +84,6 @@ public actor PeerManager {
         let pc = pieceCount > 0 ? pieceCount : 1
         let state = PeerState(pieceCount: pc)
         await state.setAmInterested(true)
-        if conn.supportsExtensions {
-            await state.setAmInterested(true)
-        }
         peerStates[key] = state
 
         // Send interested
@@ -157,11 +158,11 @@ public actor PeerManager {
             guard let pm = pieceManager else { break }
             await pm.addBlock(pieceIndex: pieceIndex, offset: offset, data: block)
 
-            // Check if all blocks received for this piece
-            let expectedSize = await pm.expectedPieceSize(pieceIndex)
-            let buffer = await pm.getPieceBuffer(pieceIndex)
-            if let buf = buffer, buf.count >= expectedSize {
-                await onPieceComplete(index: pieceIndex, data: buf)
+            // Only complete piece when ALL blocks for this piece are received
+            if await pm.areAllBlocksReceived(pieceIndex) {
+                if let buf = await pm.getPieceBuffer(pieceIndex) {
+                    await onPieceComplete(index: pieceIndex, data: buf)
+                }
             }
 
             await fillRequests(for: key)
@@ -197,38 +198,65 @@ public actor PeerManager {
         guard !peerChoking else { return }
 
         let completed = await pm.getCompleted()
+        let inProgress = await pm.getInProgress()
 
         while await state.canRequest {
             let peerBF = await state.getPeerBitfield()
-            guard let picker = piecePicker,
-                  let pieceIndex = picker.pick(have: completed, peerHas: peerBF) else { break }
 
-            // Start piece if not in progress
-            let inProg = await pm.isInProgress(pieceIndex)
-            let hasPc = await pm.hasPiece(pieceIndex)
-            if !inProg && !hasPc {
+            // Prioritize unfinished pieces currently in-progress that this peer has
+            var targetPiece: Int? = nil
+            for inProgIdx in inProgress {
+                if !completed.get(inProgIdx) && peerBF.get(inProgIdx) {
+                    let allRecv = await pm.areAllBlocksReceived(inProgIdx)
+                    if !allRecv {
+                        targetPiece = inProgIdx
+                        break
+                    }
+                }
+            }
+
+            // Otherwise pick a new piece with rarest-first
+            if targetPiece == nil {
+                guard let picker = piecePicker else { break }
+                targetPiece = picker.pick(have: completed, peerHas: peerBF)
+            }
+
+            guard let pieceIndex = targetPiece else { break }
+            if await pm.hasPiece(pieceIndex) { break }
+
+            if !(await pm.isInProgress(pieceIndex)) {
                 await pm.startPiece(pieceIndex)
             }
 
             let pieceSize = await pm.expectedPieceSize(pieceIndex)
             let blockSize = 16384
             var offset = 0
+            var requestedAny = false
+
             while offset < pieceSize {
                 let canReq = await state.canRequest
                 guard canReq else { break }
+
+                let alreadyReceived = await pm.isBlockReceived(pieceIndex: pieceIndex, offset: offset)
                 let length = min(blockSize, pieceSize - offset)
                 let request = PeerState.BlockRequest(pieceIndex: pieceIndex, offset: offset, length: length)
-                if !(await state.hasPending(request)) {
+                let alreadyPending = await state.hasPending(request)
+
+                if !alreadyReceived && !alreadyPending {
                     await state.addPendingRequest(request)
                     try? await conn.send(.request(
                         index: UInt32(pieceIndex),
                         begin: UInt32(offset),
                         length: UInt32(length)
                     ))
+                    requestedAny = true
                 }
                 offset += blockSize
             }
-            break // One piece at a time per fill cycle
+
+            if !requestedAny {
+                break
+            }
         }
     }
 
@@ -243,10 +271,6 @@ public actor PeerManager {
             await broadcastHave(pieceIndex: UInt32(pieceIndex))
             onPieceCompleted?(pieceIndex)
         }
-    }
-
-    private func markConnected(key: String) {
-        connectedPeers.insert(key)
     }
 
     private func removePeerByKey(_ key: String) {
@@ -280,25 +304,6 @@ public actor PeerManager {
     /// Number of peers that completed the TCP handshake.
     public var connectedCount: Int {
         connectedPeers.count
-    }
-
-    /// Implements the choking algorithm — unchoke top uploaders + one optimistic unchoke.
-    public func runChokingAlgorithm() async {
-        var peers = Array(peerInfos)
-        peers.sort { $0.value.downloadRate > $1.value.downloadRate }
-
-        let unchokeSlots = 4
-        for (i, peer) in peers.enumerated() {
-            var info = peer.value
-            if i < unchokeSlots {
-                info.amChoking = false
-            } else if i == unchokeSlots {
-                info.amChoking = false
-            } else {
-                info.amChoking = true
-            }
-            peerInfos[peer.key] = info
-        }
     }
 
     /// Send interested message to all peers.

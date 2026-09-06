@@ -10,22 +10,43 @@ public struct HTTPTracker: Sendable {
 
     /// Announce to the tracker.
     public func announce(params: AnnounceParams) async throws -> AnnounceResponse {
-        var components = URLComponents(string: announceURL)
-        components?.queryItems = [
-            URLQueryItem(name: "info_hash", value: params.infoHash.urlEncoded),
-            URLQueryItem(name: "peer_id", value: String(data: params.peerID, encoding: .ascii) ?? ""),
-            URLQueryItem(name: "port", value: String(params.port)),
-            URLQueryItem(name: "uploaded", value: String(params.uploaded)),
-            URLQueryItem(name: "downloaded", value: String(params.downloaded)),
-            URLQueryItem(name: "left", value: String(params.left)),
-            URLQueryItem(name: "compact", value: "1"),
-            URLQueryItem(name: "numwant", value: String(params.numWant)),
-        ]
-        if let event = params.event {
-            components?.queryItems?.append(URLQueryItem(name: "event", value: event))
+        guard var components = URLComponents(string: announceURL) else {
+            throw TrackerError.invalidURL
         }
 
-        guard let url = components?.url else {
+        // Properly URL encode binary fields without double percent-encoding
+        let infoHashEncoded = params.infoHash.urlEncoded
+        let peerIDEncoded = params.peerID.map { byte -> String in
+            let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: ".-_~"))
+            let str = String(format: "%c", byte)
+            if let scalar = str.unicodeScalars.first, allowed.contains(scalar) {
+                return str
+            }
+            return String(format: "%%%02X", byte)
+        }.joined()
+
+        var queryParts = [
+            "info_hash=\(infoHashEncoded)",
+            "peer_id=\(peerIDEncoded)",
+            "port=\(params.port)",
+            "uploaded=\(params.uploaded)",
+            "downloaded=\(params.downloaded)",
+            "left=\(params.left)",
+            "compact=1",
+            "numwant=\(params.numWant)"
+        ]
+        if let event = params.event {
+            queryParts.append("event=\(event)")
+        }
+
+        let query = queryParts.joined(separator: "&")
+        if let existing = components.percentEncodedQuery, !existing.isEmpty {
+            components.percentEncodedQuery = existing + "&" + query
+        } else {
+            components.percentEncodedQuery = query
+        }
+
+        guard let url = components.url else {
             throw TrackerError.invalidURL
         }
 
@@ -51,8 +72,9 @@ public struct HTTPTracker: Sendable {
             // Compact format: 6 bytes per peer (4 IP + 2 port)
             var offset = 0
             while offset + 6 <= peersData.count {
-                let ip = "\(peersData[offset]).\(peersData[offset+1]).\(peersData[offset+2]).\(peersData[offset+3])"
-                let port = UInt16(peersData[offset+4]) << 8 | UInt16(peersData[offset+5])
+                let start = peersData.startIndex + offset
+                let ip = "\(peersData[start]).\(peersData[start+1]).\(peersData[start+2]).\(peersData[start+3])"
+                let port = UInt16(peersData[start+4]) << 8 | UInt16(peersData[start+5])
                 peers.append((ip, port))
                 offset += 6
             }

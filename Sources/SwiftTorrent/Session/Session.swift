@@ -51,10 +51,13 @@ public actor Session {
         await handle.pause()
 
         if deleteFiles {
-            let _ = await handle.status()
-            // Delete files from disk
-            let path = settings.savePath
-            try? FileManager.default.removeItem(atPath: path)
+            let torrentName = await handle.getTorrentName()
+            let savePath = await handle.getSavePath()
+            // Only delete the torrent's specific file/directory, never the whole savePath folder
+            if !torrentName.isEmpty && torrentName != "." && torrentName != ".." && torrentName != "/" {
+                let targetURL = URL(fileURLWithPath: savePath).appendingPathComponent(torrentName)
+                try? FileManager.default.removeItem(at: targetURL)
+            }
         }
 
         alertContinuation.yield(TorrentRemovedAlert(infoHash: infoHash))

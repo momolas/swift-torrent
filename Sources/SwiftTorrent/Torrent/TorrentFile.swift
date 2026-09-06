@@ -18,15 +18,17 @@ public struct TorrentFile: Sendable {
             throw TorrentFileError.fileNotFound(path)
         }
 
-        let name = (path as NSString).lastPathComponent
+        let cleanPath = (path as NSString).standardizingPath
+        let name = (cleanPath as NSString).lastPathComponent
         var infoPairs: [(key: Data, value: BencodeValue)] = []
 
         if isDir.boolValue {
             // Multi-file torrent
-            let files = try enumerateFiles(at: path)
+            let files = try enumerateFiles(at: cleanPath)
             var fileEntries: [BencodeValue] = []
             for file in files {
-                let relativePath = String(file.path.dropFirst(path.count + 1))
+                let prefixLen = cleanPath.hasSuffix("/") ? cleanPath.count : cleanPath.count + 1
+                let relativePath = String(file.path.dropFirst(prefixLen))
                 let components = relativePath.split(separator: "/").map { String($0) }
                 let pathList = components.map { BencodeValue.string(Data($0.utf8)) }
                 let fileDict: BencodeValue = .dictionary([
@@ -38,16 +40,16 @@ public struct TorrentFile: Sendable {
             infoPairs.append((key: Data("files".utf8), value: .list(fileEntries)))
         } else {
             // Single-file torrent
-            let attrs = try fileManager.attributesOfItem(atPath: path)
-            let size = (attrs[.size] as? Int64) ?? 0
+            let attrs = try fileManager.attributesOfItem(atPath: cleanPath)
+            let size = ((attrs[.size] as? NSNumber)?.int64Value) ?? 0
             infoPairs.append((key: Data("length".utf8), value: .integer(size)))
         }
 
         infoPairs.append((key: Data("name".utf8), value: .string(Data(name.utf8))))
         infoPairs.append((key: Data("piece length".utf8), value: .integer(Int64(pieceLength))))
 
-        // Compute pieces hashes
-        let piecesData = try computePieces(path: path, isDir: isDir.boolValue, pieceLength: pieceLength)
+        // Compute pieces hashes in a memory-safe streaming fashion
+        let piecesData = try computePieces(path: cleanPath, isDir: isDir.boolValue, pieceLength: pieceLength)
         infoPairs.append((key: Data("pieces".utf8), value: .string(piecesData)))
 
         if isPrivate {
@@ -86,7 +88,7 @@ public struct TorrentFile: Sendable {
             var isDir: ObjCBool = false
             if fm.fileExists(atPath: fullPath, isDirectory: &isDir), !isDir.boolValue {
                 let attrs = try fm.attributesOfItem(atPath: fullPath)
-                let size = (attrs[.size] as? Int64) ?? 0
+                let size = ((attrs[.size] as? NSNumber)?.int64Value) ?? 0
                 files.append(FileInfo(path: fullPath, size: size))
             }
         }
@@ -94,25 +96,41 @@ public struct TorrentFile: Sendable {
     }
 
     private static func computePieces(path: String, isDir: Bool, pieceLength: Int) throws -> Data {
-        var allData = Data()
+        let filePaths: [String]
         if isDir {
             let files = try enumerateFiles(at: path)
-            for file in files {
-                allData.append(try Data(contentsOf: URL(fileURLWithPath: file.path)))
-            }
+            filePaths = files.map(\.path)
         } else {
-            allData = try Data(contentsOf: URL(fileURLWithPath: path))
+            filePaths = [path]
         }
 
         var pieces = Data()
-        var offset = 0
-        while offset < allData.count {
-            let end = min(offset + pieceLength, allData.count)
-            let chunk = allData[offset..<end]
-            let hash = Insecure.SHA1.hash(data: chunk)
-            pieces.append(contentsOf: hash)
-            offset = end
+        var currentPieceBuffer = Data()
+        currentPieceBuffer.reserveCapacity(pieceLength)
+
+        for filePath in filePaths {
+            let handle = try FileHandle(forReadingFrom: URL(fileURLWithPath: filePath))
+            defer { try? handle.close() }
+
+            while true {
+                let needed = pieceLength - currentPieceBuffer.count
+                let chunk = handle.readData(ofLength: needed)
+                if chunk.isEmpty { break }
+                currentPieceBuffer.append(chunk)
+
+                if currentPieceBuffer.count == pieceLength {
+                    let hash = Insecure.SHA1.hash(data: currentPieceBuffer)
+                    pieces.append(contentsOf: hash)
+                    currentPieceBuffer.removeAll(keepingCapacity: true)
+                }
+            }
         }
+
+        if !currentPieceBuffer.isEmpty {
+            let hash = Insecure.SHA1.hash(data: currentPieceBuffer)
+            pieces.append(contentsOf: hash)
+        }
+
         return pieces
     }
 }

@@ -24,8 +24,6 @@ public actor TorrentHandle {
     private var state: TorrentState = .paused
     private var totalDownloaded: Int64 = 0
     private var totalUploaded: Int64 = 0
-    private var lastDownloadRateSample: Int64 = 0
-    private var lastUploadRateSample: Int64 = 0
     private var downloadRate: Double = 0
     private var uploadRate: Double = 0
     private var reannounceTask: Task<Void, Never>?
@@ -72,6 +70,17 @@ public actor TorrentHandle {
             pieceManager: pm, piecePicker: pp, diskIO: dio,
             pieceCount: info.pieceCount
         )
+
+        let weakSelf = self
+        await peerManager.setOnPieceCompleted { pieceIndex in
+            Task { await weakSelf.handlePieceCompleted(pieceIndex) }
+        }
+    }
+
+    private func handlePieceCompleted(_ pieceIndex: Int) async {
+        guard let pm = pieceManager else { return }
+        let size = Int64(await pm.expectedPieceSize(pieceIndex))
+        totalDownloaded += size
     }
 
     /// Complete initialization for .torrent-file init path (must be called after init).
@@ -132,9 +141,23 @@ public actor TorrentHandle {
 
     private func startDownloadMonitor() {
         downloadMonitorTask = Task { [weak self] in
+            var lastSampleTime = Date()
+            var lastDownloaded: Int64 = 0
+
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(2))
                 guard let self, !Task.isCancelled else { break }
+
+                let now = Date()
+                let elapsed = now.timeIntervalSince(lastSampleTime)
+                if elapsed > 0 {
+                    let currentDownloaded = await self.totalDownloaded
+                    let delta = currentDownloaded - lastDownloaded
+                    await self.setDownloadRate(Double(delta) / elapsed)
+                    lastSampleTime = now
+                    lastDownloaded = currentDownloaded
+                }
+
                 let complete = await self.checkCompletion()
                 if complete {
                     await self.transitionToSeeding()
@@ -145,6 +168,10 @@ public actor TorrentHandle {
         }
     }
 
+    private func setDownloadRate(_ rate: Double) {
+        self.downloadRate = rate
+    }
+
     private func checkCompletion() async -> Bool {
         guard let pm = pieceManager else { return false }
         return await pm.isComplete()
@@ -152,6 +179,7 @@ public actor TorrentHandle {
 
     private func transitionToSeeding() {
         state = .seeding
+        downloadRate = 0
         downloadMonitorTask?.cancel()
 
         // Resume all waiting completion continuations
@@ -199,12 +227,14 @@ public actor TorrentHandle {
     }
 
     private func getRemainingBytes() -> Int64 {
-        (info?.totalSize ?? 0) - totalDownloaded
+        max(0, (info?.totalSize ?? 0) - totalDownloaded)
     }
 
     /// Pause the torrent.
     public func pause() {
         state = .paused
+        downloadRate = 0
+        uploadRate = 0
         reannounceTask?.cancel()
         downloadMonitorTask?.cancel()
     }
@@ -246,6 +276,16 @@ public actor TorrentHandle {
     /// Returns the file entries for this torrent, or nil if metadata is not yet available.
     public func getFiles() -> [TorrentInfo.FileEntry]? {
         info?.files
+    }
+
+    /// Returns the save path for this torrent.
+    public func getSavePath() -> String {
+        savePath
+    }
+
+    /// Returns the name of the torrent or magnet link.
+    public func getTorrentName() -> String {
+        info?.name ?? magnetLink?.displayName ?? ""
     }
 
     /// Generate resume data for saving state.

@@ -56,7 +56,6 @@ public actor DHTNode {
     /// Bootstrap by contacting well-known DHT nodes.
     private func bootstrap() async {
         for (host, port) in bootstrapNodes {
-            // Resolve hostname
             if let ip = try? await resolveHostname(host) {
                 do {
                     try await findNode(target: nodeID, to: ip, port: UInt16(port))
@@ -71,21 +70,15 @@ public actor DHTNode {
     private func handleIncomingMessage(_ message: DHTMessage, from address: String, port: UInt16) {
         switch message {
         case .response(let txID, let values):
-            // Check if there's a pending query for this txID
             if let cont = pendingQueries.removeValue(forKey: txID) {
                 cont.resume(returning: message)
             }
 
-            // Extract nodes from response and add to routing table
             if let nodesData = values.first(where: { String(data: $0.key, encoding: .utf8) == "nodes" })?.value.stringValue {
                 parseCompactNodes(nodesData)
             }
 
-            // Extract peers from get_peers response
-            // (handled by DHTTraversal via sendAndWait)
-
         case .query(let txID, let queryType, let args):
-            // Respond to queries from other nodes
             handleQuery(txID: txID, queryType: queryType, args: args, from: address, port: port)
 
         case .error:
@@ -112,7 +105,14 @@ public actor DHTNode {
             Task { try? await sendMessage(response, to: address, port: port) }
 
         case .findNode:
-            let closest = routingTable.closestNodes(to: nodeID)
+            let targetID: NodeID
+            if let targetData = args.first(where: { String(data: $0.key, encoding: .utf8) == "target" })?.value.stringValue,
+               targetData.count == 20 {
+                targetID = NodeID(bytes: targetData)
+            } else {
+                targetID = nodeID
+            }
+            let closest = routingTable.closestNodes(to: targetID)
             let nodesData = encodeCompactNodes(closest)
             let response = DHTMessage.response(transactionID: txID, values: [
                 (key: Data("id".utf8), value: .string(nodeID.bytes)),
@@ -142,7 +142,8 @@ public actor DHTNode {
                     ])
                     Task { try? await sendMessage(response, to: address, port: port) }
                 } else {
-                    let closest = routingTable.closestNodes(to: nodeID)
+                    let targetID = hashData.count == 20 ? NodeID(bytes: hashData) : nodeID
+                    let closest = routingTable.closestNodes(to: targetID)
                     let nodesData = encodeCompactNodes(closest)
                     let response = DHTMessage.response(transactionID: txID, values: [
                         (key: Data("id".utf8), value: .string(nodeID.bytes)),
@@ -331,7 +332,10 @@ public actor DHTNode {
                     return
                 }
                 defer { freeaddrinfo(result) }
-                let addr = addrInfo.pointee.ai_addr!
+                guard let addr = addrInfo.pointee.ai_addr else {
+                    continuation.resume(throwing: DHTMessageError.invalidMessage)
+                    return
+                }
                 var hostBuf = [CChar](repeating: 0, count: Int(NI_MAXHOST))
                 getnameinfo(addr, addrInfo.pointee.ai_addrlen, &hostBuf, socklen_t(NI_MAXHOST), nil, 0, NI_NUMERICHOST)
                 continuation.resume(returning: String(cString: hostBuf))

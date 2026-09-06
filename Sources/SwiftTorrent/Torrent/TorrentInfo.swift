@@ -21,6 +21,40 @@ public struct TorrentInfo: Sendable {
         public let path: String
         public let length: Int64
         public let offset: Int64  // byte offset within the torrent data
+
+        public init(path: String, length: Int64, offset: Int64) {
+            self.path = path
+            self.length = length
+            self.offset = offset
+        }
+    }
+
+    public init(
+        infoHash: InfoHash,
+        name: String,
+        pieceLength: Int,
+        pieces: Data,
+        totalSize: Int64,
+        files: [FileEntry],
+        isPrivate: Bool,
+        comment: String?,
+        createdBy: String?,
+        creationDate: Date?,
+        announceURL: String?,
+        announceList: [[String]]
+    ) {
+        self.infoHash = infoHash
+        self.name = name
+        self.pieceLength = pieceLength
+        self.pieces = pieces
+        self.totalSize = totalSize
+        self.files = files
+        self.isPrivate = isPrivate
+        self.comment = comment
+        self.createdBy = createdBy
+        self.creationDate = creationDate
+        self.announceURL = announceURL
+        self.announceList = announceList
     }
 
     public var pieceCount: Int {
@@ -44,9 +78,14 @@ public struct TorrentInfo: Sendable {
         let infoData = try findInfoDictBytes(in: data)
         let infoHash = InfoHash.v1(from: infoData)
 
-        guard let nameValue = infoValue["name"], let name = nameValue.utf8String else {
+        guard let nameValue = infoValue["name"], let rawName = nameValue.utf8String else {
             throw TorrentInfoError.invalidFormat("Missing 'name'")
         }
+        let safeName = sanitizePathComponent(rawName)
+        guard !safeName.isEmpty else {
+            throw TorrentInfoError.invalidFormat("Invalid 'name' component")
+        }
+
         guard let plValue = infoValue["piece length"], let pieceLength = plValue.integerValue else {
             throw TorrentInfoError.invalidFormat("Missing 'piece length'")
         }
@@ -67,14 +106,21 @@ public struct TorrentInfo: Sendable {
                       let pathList = fileValue["path"]?.listValue else {
                     throw TorrentInfoError.invalidFormat("Invalid file entry")
                 }
-                let pathComponents = pathList.compactMap { $0.utf8String }
-                let path = ([name] + pathComponents).joined(separator: "/")
+                let rawComponents = pathList.compactMap { $0.utf8String }
+                let safeComponents = rawComponents.compactMap { comp -> String? in
+                    let sanitized = sanitizePathComponent(comp)
+                    return sanitized.isEmpty ? nil : sanitized
+                }
+                guard !safeComponents.isEmpty else {
+                    throw TorrentInfoError.invalidFormat("Invalid or unsafe file path")
+                }
+                let path = ([safeName] + safeComponents).joined(separator: "/")
                 files.append(FileEntry(path: path, length: length, offset: totalSize))
                 totalSize += length
             }
         } else if let length = infoValue["length"]?.integerValue {
             // Single-file torrent
-            files.append(FileEntry(path: name, length: length, offset: 0))
+            files.append(FileEntry(path: safeName, length: length, offset: 0))
             totalSize = length
         } else {
             throw TorrentInfoError.invalidFormat("Missing 'length' or 'files'")
@@ -96,7 +142,7 @@ public struct TorrentInfo: Sendable {
         }
 
         return TorrentInfo(
-            infoHash: infoHash, name: name, pieceLength: Int(pieceLength),
+            infoHash: infoHash, name: safeName, pieceLength: Int(pieceLength),
             pieces: pieces, totalSize: totalSize, files: files,
             isPrivate: isPrivate, comment: comment, createdBy: createdBy,
             creationDate: creationDate, announceURL: announceURL,
@@ -104,17 +150,50 @@ public struct TorrentInfo: Sendable {
         )
     }
 
+    /// Sanitize single path component preventing directory traversal attacks.
+    public static func sanitizePathComponent(_ component: String) -> String {
+        var comp = component.replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "\\", with: "_")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        while comp.contains("..") {
+            comp = comp.replacingOccurrences(of: "..", with: "_")
+        }
+        if comp == "." { return "_" }
+        return comp
+    }
+
     /// Extract raw bytes of the "info" dictionary value from bencoded data.
     private static func findInfoDictBytes(in data: Data) throws -> Data {
-        // Search for "4:info" key then capture the value
-        guard let range = data.range(of: Data("4:info".utf8)) else {
-            throw TorrentInfoError.invalidFormat("Cannot find info key")
+        // Find top-level info key by walking top-level dictionary
+        let decoder = BencodeDecoder()
+        var index = data.startIndex
+        guard index < data.endIndex, data[index] == UInt8(ascii: "d") else {
+            throw TorrentInfoError.invalidFormat("Root is not a dictionary")
         }
-        let valueStart = range.upperBound
-        // Parse from valueStart to find where the value ends
-        var index = valueStart
-        try skipBencodeValue(data, index: &index)
-        return Data(data[valueStart..<index])
+        index = data.index(after: index) // skip 'd'
+
+        while index < data.endIndex && data[index] != UInt8(ascii: "e") {
+            let keyStart = index
+            let keyValue = try decoder.decodeWithRange(Data(data[keyStart...])).value
+            guard case .string(let keyData) = keyValue else {
+                throw TorrentInfoError.invalidFormat("Invalid dictionary key")
+            }
+            // Advance index past the key string bencode representation
+            let colonIdx = data[index...].firstIndex(of: UInt8(ascii: ":"))!
+            let keyLen = keyData.count
+            index = data.index(colonIdx, offsetBy: 1 + keyLen)
+
+            let valueStart = index
+            if keyData == Data("info".utf8) {
+                var valIndex = valueStart
+                try skipBencodeValue(data, index: &valIndex)
+                return Data(data[valueStart..<valIndex])
+            } else {
+                try skipBencodeValue(data, index: &index)
+            }
+        }
+
+        throw TorrentInfoError.invalidFormat("Cannot find info key")
     }
 
     private static func skipBencodeValue(_ data: Data, index: inout Data.Index) throws {

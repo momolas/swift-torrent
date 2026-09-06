@@ -16,13 +16,13 @@ public final class UDPTracker: Sendable {
 
     /// Announce to the UDP tracker.
     public func announce(params: AnnounceParams) async throws -> AnnounceResponse {
-        // Resolve hostname to IP address first
+        // Resolve host
         let resolvedHost: String
-        if host.first?.isLetter == true {
-            // It's a hostname, resolve it
-            resolvedHost = try await resolveHostname(host)
-        } else {
+        do {
+            _ = try SocketAddress(ipAddress: host, port: port)
             resolvedHost = host
+        } catch {
+            resolvedHost = try await resolveHostname(host)
         }
 
         let handler = UDPResponseHandler()
@@ -75,7 +75,17 @@ public final class UDPTracker: Sendable {
         announceReq.append(contentsOf: params.downloaded.bigEndianBytes)
         announceReq.append(contentsOf: params.left.bigEndianBytes)
         announceReq.append(contentsOf: params.uploaded.bigEndianBytes)
-        announceReq.append(contentsOf: UInt32(2).bigEndianBytes) // event: started
+
+        // Map event correctly: 0=none, 1=completed, 2=started, 3=stopped
+        let eventCode: UInt32
+        switch params.event?.lowercased() {
+        case "completed": eventCode = 1
+        case "started": eventCode = 2
+        case "stopped": eventCode = 3
+        default: eventCode = 0
+        }
+        announceReq.append(contentsOf: eventCode.bigEndianBytes)
+
         announceReq.append(contentsOf: UInt32(0).bigEndianBytes) // IP
         announceReq.append(contentsOf: UInt32.random(in: 0...UInt32.max).bigEndianBytes) // key
         announceReq.append(contentsOf: Int32(params.numWant).bigEndianBytes)
@@ -105,7 +115,8 @@ public final class UDPTracker: Sendable {
         var peers: [(String, UInt16)] = []
         var offset = 20
         while offset + 6 <= announceResponse.count {
-            let ip = "\(announceResponse[announceResponse.startIndex + offset]).\(announceResponse[announceResponse.startIndex + offset + 1]).\(announceResponse[announceResponse.startIndex + offset + 2]).\(announceResponse[announceResponse.startIndex + offset + 3])"
+            let start = announceResponse.startIndex + offset
+            let ip = "\(announceResponse[start]).\(announceResponse[start + 1]).\(announceResponse[start + 2]).\(announceResponse[start + 3])"
             let peerPort = announceResponse.readUInt16BE(at: offset + 4)
             peers.append((ip, peerPort))
             offset += 6
@@ -127,7 +138,10 @@ public final class UDPTracker: Sendable {
                     return
                 }
                 defer { freeaddrinfo(result) }
-                let addr = addrInfo.pointee.ai_addr!
+                guard let addr = addrInfo.pointee.ai_addr else {
+                    continuation.resume(throwing: TrackerError.connectionFailed)
+                    return
+                }
                 var hostBuf = [CChar](repeating: 0, count: Int(NI_MAXHOST))
                 getnameinfo(addr, addrInfo.pointee.ai_addrlen, &hostBuf, socklen_t(NI_MAXHOST), nil, 0, NI_NUMERICHOST)
                 continuation.resume(returning: String(cString: hostBuf))
@@ -162,8 +176,7 @@ private final class UDPResponseHandler: ChannelInboundHandler, @unchecked Sendab
         }
     }
 
-    func waitForResponse(timeout: TimeAmount) async throws -> Data {
-        // Check if we already have data
+    func waitForResponse(timeout: TimeAmount = .seconds(5)) async throws -> Data {
         lock.lock()
         if !receivedData.isEmpty {
             let data = receivedData.removeFirst()
@@ -184,9 +197,9 @@ private final class UDPResponseHandler: ChannelInboundHandler, @unchecked Sendab
                 continuations[id] = continuation
                 lock.unlock()
 
-                // Timeout
+                let seconds = Double(timeout.nanoseconds) / 1_000_000_000.0
                 Task {
-                    try? await Task.sleep(for: .seconds(5))
+                    try? await Task.sleep(for: .seconds(max(seconds, 1)))
                     self.lock.lock()
                     if let cont = self.continuations.removeValue(forKey: id) {
                         self.lock.unlock()

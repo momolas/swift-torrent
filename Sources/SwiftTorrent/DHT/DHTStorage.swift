@@ -34,10 +34,12 @@ public struct DHTStorage: Sendable {
             .map { ($0.address, $0.port) }
     }
 
-    /// Remove expired entries.
+    /// Remove expired entries safely without mutating during traversal.
     public mutating func removeExpired() {
         let cutoff = Date().addingTimeInterval(-expirationInterval)
-        for (hash, peers) in peerStore {
+        let keys = Array(peerStore.keys)
+        for hash in keys {
+            guard let peers = peerStore[hash] else { continue }
             let filtered = peers.filter { $0.addedAt > cutoff }
             if filtered.isEmpty {
                 peerStore.removeValue(forKey: hash)

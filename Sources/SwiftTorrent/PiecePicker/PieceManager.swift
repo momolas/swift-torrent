@@ -1,7 +1,7 @@
 import Foundation
 import Crypto
 
-/// Tracks piece completion and verifies SHA-1 hashes.
+/// Tracks piece completion, block arrivals, and verifies SHA-1 hashes.
 public actor PieceManager {
     private let pieceCount: Int
     private let pieceLength: Int
@@ -10,6 +10,7 @@ public actor PieceManager {
     private var completed: Bitfield
     private var inProgress: Set<Int>
     private var pieceBuffers: [Int: Data]
+    private var receivedBlocks: [Int: Set<Int>]  // pieceIndex -> set of block offsets
 
     public init(info: TorrentInfo) {
         self.pieceCount = info.pieceCount
@@ -19,28 +20,46 @@ public actor PieceManager {
         self.completed = Bitfield(count: info.pieceCount)
         self.inProgress = []
         self.pieceBuffers = [:]
+        self.receivedBlocks = [:]
     }
 
     /// Mark a piece as being downloaded.
     public func startPiece(_ index: Int) {
         inProgress.insert(index)
         pieceBuffers[index] = Data()
+        receivedBlocks[index] = []
     }
 
     /// Add a block to a piece being downloaded.
     public func addBlock(pieceIndex: Int, offset: Int, data: Data) {
+        if pieceBuffers[pieceIndex] == nil {
+            startPiece(pieceIndex)
+        }
         guard var buffer = pieceBuffers[pieceIndex] else { return }
-        // Ensure buffer is large enough
         let needed = offset + data.count
         if buffer.count < needed {
             buffer.append(Data(count: needed - buffer.count))
         }
         buffer.replaceSubrange(offset..<offset + data.count, with: data)
         pieceBuffers[pieceIndex] = buffer
+        receivedBlocks[pieceIndex, default: []].insert(offset)
+    }
+
+    /// Check if a specific block has already been received.
+    public func isBlockReceived(pieceIndex: Int, offset: Int) -> Bool {
+        receivedBlocks[pieceIndex]?.contains(offset) ?? false
+    }
+
+    /// Check if all expected blocks for a piece have been received.
+    public func areAllBlocksReceived(_ pieceIndex: Int) -> Bool {
+        let expectedBlocks = blockCount(for: pieceIndex)
+        let count = receivedBlocks[pieceIndex]?.count ?? 0
+        return count >= expectedBlocks
     }
 
     /// Verify and complete a piece.
     public func completePiece(_ index: Int) -> Bool {
+        guard areAllBlocksReceived(index) else { return false }
         guard let buffer = pieceBuffers[index] else { return false }
 
         // Verify hash
@@ -50,6 +69,7 @@ public actor PieceManager {
         guard actualHash == expectedHash else {
             // Hash mismatch — piece is corrupt
             pieceBuffers.removeValue(forKey: index)
+            receivedBlocks.removeValue(forKey: index)
             inProgress.remove(index)
             return false
         }
@@ -57,6 +77,7 @@ public actor PieceManager {
         completed.set(index)
         inProgress.remove(index)
         pieceBuffers.removeValue(forKey: index)
+        receivedBlocks.removeValue(forKey: index)
         return true
     }
 
@@ -101,6 +122,11 @@ public actor PieceManager {
     /// Whether a piece is currently being downloaded.
     public func isInProgress(_ index: Int) -> Bool {
         inProgress.contains(index)
+    }
+
+    /// Get all pieces currently in progress.
+    public func getInProgress() -> Set<Int> {
+        inProgress
     }
 
     /// The standard piece length for this torrent.
