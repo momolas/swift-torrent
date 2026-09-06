@@ -12,7 +12,8 @@ public enum TorrentState: String, Sendable {
 }
 
 /// A snapshot of a torrent's current status.
-public struct TorrentStatus: Sendable {
+public struct TorrentStatus: Identifiable, Equatable, Sendable {
+    public var id: InfoHash { infoHash }
     public let infoHash: InfoHash
     public let name: String
     public let state: TorrentState

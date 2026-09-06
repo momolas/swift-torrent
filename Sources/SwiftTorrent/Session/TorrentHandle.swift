@@ -71,9 +71,8 @@ public actor TorrentHandle {
             pieceCount: info.pieceCount
         )
 
-        let weakSelf = self
-        await peerManager.setOnPieceCompleted { pieceIndex in
-            Task { await weakSelf.handlePieceCompleted(pieceIndex) }
+        await peerManager.setOnPieceCompleted { [weak self] pieceIndex in
+            Task { await self?.handlePieceCompleted(pieceIndex) }
         }
     }
 
@@ -105,9 +104,8 @@ public actor TorrentHandle {
             let metaEx = MetadataExchange(infoHash: infoHash)
             self.metadataExchange = metaEx
             await peerManager.configureMagnet(metadataExchange: metaEx)
-            let weakSelf = self
-            await peerManager.setOnMetadataReceived { info in
-                Task { await weakSelf.onMetadataReceived(info: info) }
+            await peerManager.setOnMetadataReceived { [weak self] info in
+                Task { await self?.onMetadataReceived(info: info) }
             }
         } else {
             state = .downloading
