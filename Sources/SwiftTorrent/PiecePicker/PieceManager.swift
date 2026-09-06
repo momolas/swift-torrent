@@ -138,4 +138,22 @@ public actor PieceManager {
     public func getPieceCount() -> Int {
         pieceCount
     }
+
+    /// Mark a piece as already verified and completed (e.g. from resume or disk check).
+    public func setPieceCompleted(_ index: Int) {
+        guard index >= 0 && index < pieceCount else { return }
+        completed.set(index)
+        inProgress.remove(index)
+        pieceBuffers.removeValue(forKey: index)
+        receivedBlocks.removeValue(forKey: index)
+    }
+
+    /// Set initial completed bitfield from resume data.
+    public func setCompletedBitfield(_ bitfield: Bitfield) {
+        for i in 0..<min(pieceCount, bitfield.count) {
+            if bitfield.get(i) {
+                completed.set(i)
+            }
+        }
+    }
 }

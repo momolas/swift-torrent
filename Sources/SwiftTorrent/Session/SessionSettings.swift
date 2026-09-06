@@ -11,6 +11,8 @@ public struct SessionSettings: Sendable {
     public var dhtPort: Int
     public var userAgent: String
     public var savePath: String
+    public var usePartExtension: Bool
+    public var maxUploadRatio: Double // 0.0 = unlimited, e.g. 1.0 = stop when uploaded == downloaded
 
     public init(
         listenPort: UInt16 = 6881,
@@ -21,7 +23,9 @@ public struct SessionSettings: Sendable {
         dhtEnabled: Bool = true,
         dhtPort: Int = 6881,
         userAgent: String = "SwiftTorrent/1.0",
-        savePath: String = NSTemporaryDirectory()
+        savePath: String = NSTemporaryDirectory(),
+        usePartExtension: Bool = true,
+        maxUploadRatio: Double = 0.0
     ) {
         self.listenPort = listenPort
         self.maxConnections = maxConnections
@@ -32,5 +36,7 @@ public struct SessionSettings: Sendable {
         self.dhtPort = dhtPort
         self.userAgent = userAgent
         self.savePath = savePath
+        self.usePartExtension = usePartExtension
+        self.maxUploadRatio = maxUploadRatio
     }
 }
