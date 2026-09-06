@@ -13,6 +13,7 @@ public struct SessionSettings: Sendable {
     public var savePath: String
     public var usePartExtension: Bool
     public var maxUploadRatio: Double // 0.0 = unlimited, e.g. 1.0 = stop when uploaded == downloaded
+    public var uploadMultiplier: Double // 1.0 = normal/honest, 12.0 = Momo L'As booster factor
 
     public init(
         listenPort: UInt16 = 6881,
@@ -25,7 +26,8 @@ public struct SessionSettings: Sendable {
         userAgent: String = "SwiftTorrent/1.0",
         savePath: String = NSTemporaryDirectory(),
         usePartExtension: Bool = true,
-        maxUploadRatio: Double = 0.0
+        maxUploadRatio: Double = 0.0,
+        uploadMultiplier: Double = 1.0
     ) {
         self.listenPort = listenPort
         self.maxConnections = maxConnections
@@ -38,5 +40,6 @@ public struct SessionSettings: Sendable {
         self.savePath = savePath
         self.usePartExtension = usePartExtension
         self.maxUploadRatio = maxUploadRatio
+        self.uploadMultiplier = uploadMultiplier
     }
 }
