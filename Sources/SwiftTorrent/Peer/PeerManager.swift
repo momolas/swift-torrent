@@ -18,7 +18,9 @@ public actor PeerManager {
     public var diskIO: DiskIO?
     public var metadataExchange: MetadataExchange?
     public var onPieceCompleted: ((Int) -> Void)?
+    public var onBlockReceived: ((Int) -> Void)?
     public var onMetadataReceived: ((TorrentInfo) -> Void)?
+    private var globalPendingRequests: [PeerState.BlockRequest: String] = [:]
 
     private var pieceCount: Int = 0
 
@@ -46,6 +48,10 @@ public actor PeerManager {
 
     public func setOnPieceCompleted(_ handler: @escaping (Int) -> Void) {
         self.onPieceCompleted = handler
+    }
+
+    public func setOnBlockReceived(_ handler: @escaping (Int) -> Void) {
+        self.onBlockReceived = handler
     }
 
     /// Add a peer and attempt connection.
@@ -154,6 +160,8 @@ public actor PeerManager {
             let offset = Int(begin)
             let request = PeerState.BlockRequest(pieceIndex: pieceIndex, offset: offset, length: block.count)
             await state.removePendingRequest(request)
+            globalPendingRequests.removeValue(forKey: request)
+            onBlockReceived?(block.count)
 
             guard let pm = pieceManager else { break }
             await pm.addBlock(pieceIndex: pieceIndex, offset: offset, data: block)
@@ -199,30 +207,43 @@ public actor PeerManager {
 
         let completed = await pm.getCompleted()
         let inProgress = await pm.getInProgress()
+        let peerBF = await state.getPeerBitfield()
+
+        var triedPieces: Set<Int> = []
 
         while await state.canRequest {
-            let peerBF = await state.getPeerBitfield()
-
-            // Prioritize unfinished pieces currently in-progress that this peer has
             var targetPiece: Int? = nil
+
+            // 1. Try unfinished pieces in progress first that this peer has
             for inProgIdx in inProgress {
-                if !completed.get(inProgIdx) && peerBF.get(inProgIdx) {
-                    let allRecv = await pm.areAllBlocksReceived(inProgIdx)
-                    if !allRecv {
+                if !completed.get(inProgIdx) && peerBF.get(inProgIdx) && !triedPieces.contains(inProgIdx) {
+                    if !(await isPieceFullyRequested(inProgIdx, pieceManager: pm)) {
                         targetPiece = inProgIdx
                         break
+                    } else {
+                        triedPieces.insert(inProgIdx)
                     }
                 }
             }
 
-            // Otherwise pick a new piece with rarest-first
-            if targetPiece == nil {
-                guard let picker = piecePicker else { break }
-                targetPiece = picker.pick(have: completed, peerHas: peerBF)
+            // 2. Otherwise pick a new piece with rarest-first
+            if targetPiece == nil, let picker = piecePicker {
+                var tempHave = completed
+                for tried in triedPieces {
+                    tempHave.set(tried)
+                }
+                for inProg in inProgress {
+                    tempHave.set(inProg)
+                }
+                if let picked = picker.pick(have: tempHave, peerHas: peerBF) {
+                    targetPiece = picked
+                }
             }
 
             guard let pieceIndex = targetPiece else { break }
-            if await pm.hasPiece(pieceIndex) { break }
+            triedPieces.insert(pieceIndex)
+
+            if await pm.hasPiece(pieceIndex) { continue }
 
             if !(await pm.isInProgress(pieceIndex)) {
                 await pm.startPiece(pieceIndex)
@@ -231,7 +252,6 @@ public actor PeerManager {
             let pieceSize = await pm.expectedPieceSize(pieceIndex)
             let blockSize = 16384
             var offset = 0
-            var requestedAny = false
 
             while offset < pieceSize {
                 let canReq = await state.canRequest
@@ -240,24 +260,37 @@ public actor PeerManager {
                 let alreadyReceived = await pm.isBlockReceived(pieceIndex: pieceIndex, offset: offset)
                 let length = min(blockSize, pieceSize - offset)
                 let request = PeerState.BlockRequest(pieceIndex: pieceIndex, offset: offset, length: length)
-                let alreadyPending = await state.hasPending(request)
+                let alreadyPendingGlobally = (globalPendingRequests[request] != nil)
 
-                if !alreadyReceived && !alreadyPending {
+                if !alreadyReceived && !alreadyPendingGlobally {
+                    globalPendingRequests[request] = key
                     await state.addPendingRequest(request)
                     try? await conn.send(.request(
                         index: UInt32(pieceIndex),
                         begin: UInt32(offset),
                         length: UInt32(length)
                     ))
-                    requestedAny = true
                 }
                 offset += blockSize
             }
-
-            if !requestedAny {
-                break
-            }
         }
+    }
+
+    private func isPieceFullyRequested(_ pieceIndex: Int, pieceManager: PieceManager) async -> Bool {
+        let pieceSize = await pieceManager.expectedPieceSize(pieceIndex)
+        let blockSize = 16384
+        var offset = 0
+        while offset < pieceSize {
+            let length = min(blockSize, pieceSize - offset)
+            let request = PeerState.BlockRequest(pieceIndex: pieceIndex, offset: offset, length: length)
+            let received = await pieceManager.isBlockReceived(pieceIndex: pieceIndex, offset: offset)
+            let pending = (globalPendingRequests[request] != nil)
+            if !received && !pending {
+                return false
+            }
+            offset += blockSize
+        }
+        return true
     }
 
     private func onPieceComplete(index pieceIndex: Int, data: Data) async {
@@ -278,6 +311,7 @@ public actor PeerManager {
         peerInfos.removeValue(forKey: key)
         peerStates.removeValue(forKey: key)
         connectedPeers.remove(key)
+        globalPendingRequests = globalPendingRequests.filter { $0.value != key }
     }
 
     /// Remove a peer.
@@ -335,6 +369,7 @@ public actor PeerManager {
             let timedOut = await state.timedOutRequests()
             for request in timedOut {
                 await state.removePendingRequest(request)
+                globalPendingRequests.removeValue(forKey: request)
             }
             if !timedOut.isEmpty {
                 await fillRequests(for: key)
@@ -351,5 +386,6 @@ public actor PeerManager {
         peerInfos.removeAll()
         peerStates.removeAll()
         connectedPeers.removeAll()
+        globalPendingRequests.removeAll()
     }
 }

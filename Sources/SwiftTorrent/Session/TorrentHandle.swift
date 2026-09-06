@@ -24,6 +24,7 @@ public actor TorrentHandle {
     private var state: TorrentState = .paused
     private var totalDownloaded: Int64 = 0
     private var totalUploaded: Int64 = 0
+    private var downloadedBytesWindow: Int64 = 0
     private var downloadRate: Double = 0
     private var uploadRate: Double = 0
     private var reannounceTask: Task<Void, Never>?
@@ -74,12 +75,24 @@ public actor TorrentHandle {
         await peerManager.setOnPieceCompleted { [weak self] pieceIndex in
             Task { await self?.handlePieceCompleted(pieceIndex) }
         }
+        await peerManager.setOnBlockReceived { [weak self] bytes in
+            Task { await self?.handleBlockReceived(bytes) }
+        }
     }
 
     private func handlePieceCompleted(_ pieceIndex: Int) async {
-        guard let pm = pieceManager else { return }
-        let size = Int64(await pm.expectedPieceSize(pieceIndex))
-        totalDownloaded += size
+        // Piece verified and written to disk
+    }
+
+    private func handleBlockReceived(_ bytes: Int) {
+        totalDownloaded += Int64(bytes)
+        downloadedBytesWindow += Int64(bytes)
+    }
+
+    private func consumeWindowBytes() -> Int64 {
+        let bytes = downloadedBytesWindow
+        downloadedBytesWindow = 0
+        return bytes
     }
 
     /// Complete initialization for .torrent-file init path (must be called after init).
@@ -140,20 +153,28 @@ public actor TorrentHandle {
     private func startDownloadMonitor() {
         downloadMonitorTask = Task { [weak self] in
             var lastSampleTime = Date()
-            var lastDownloaded: Int64 = 0
 
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(2))
+                try? await Task.sleep(for: .seconds(1))
                 guard let self, !Task.isCancelled else { break }
 
                 let now = Date()
                 let elapsed = now.timeIntervalSince(lastSampleTime)
                 if elapsed > 0 {
-                    let currentDownloaded = await self.totalDownloaded
-                    let delta = currentDownloaded - lastDownloaded
-                    await self.setDownloadRate(Double(delta) / elapsed)
+                    let bytesInWindow = await self.consumeWindowBytes()
+                    let instantRate = Double(bytesInWindow) / elapsed
+                    let currentRate = await self.downloadRate
+                    // Exponential moving average filter (EMA) to prevent sawtooth fluctuation
+                    let smoothedRate: Double
+                    if bytesInWindow == 0 && currentRate < 4096 {
+                        smoothedRate = 0
+                    } else if currentRate == 0 {
+                        smoothedRate = instantRate
+                    } else {
+                        smoothedRate = currentRate * 0.70 + instantRate * 0.30
+                    }
+                    await self.setDownloadRate(smoothedRate)
                     lastSampleTime = now
-                    lastDownloaded = currentDownloaded
                 }
 
                 let complete = await self.checkCompletion()
