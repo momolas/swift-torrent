@@ -33,6 +33,8 @@ public actor TorrentHandle {
     private var metadataContinuations: [UInt64: CheckedContinuation<TorrentInfo, Error>] = [:]
     private var completionContinuations: [UInt64: CheckedContinuation<Void, Error>] = [:]
     private var nextWaitID: UInt64 = 0
+    private let settings: SessionSettings
+    private var resumeData: ResumeData?
 
     public init(params: AddTorrentParams, settings: SessionSettings, group: EventLoopGroup) {
         let hash = params.infoHash!
@@ -42,6 +44,8 @@ public actor TorrentHandle {
         self.savePath = params.savePath ?? settings.savePath
         self.peerID = generatePeerID()
         self.group = group
+        self.settings = settings
+        self.resumeData = params.resumeData
         self.peerManager = PeerManager(
             infoHash: hash.bytes, peerID: peerID, group: group,
             maxConnections: settings.maxConnectionsPerTorrent
@@ -58,7 +62,7 @@ public actor TorrentHandle {
         let pm = PieceManager(info: info)
         let pp = PiecePicker(pieceCount: info.pieceCount)
         let fs = FileStorage(info: info)
-        let dio = DiskIO(basePath: savePath, fileStorage: fs)
+        let dio = DiskIO(basePath: savePath, fileStorage: fs, usePartExtension: settings.usePartExtension)
         self.pieceManager = pm
         self.piecePicker = pp
         self.diskIO = dio
@@ -77,6 +81,45 @@ public actor TorrentHandle {
         }
         await peerManager.setOnBlockReceived { [weak self] bytes in
             Task { await self?.handleBlockReceived(bytes) }
+        }
+    }
+
+    private func checkExistingFilesOrResume(info: TorrentInfo, pm: PieceManager, dio: DiskIO) async {
+        // Fast resume: if resumeData was provided and files exist on disk, use it directly
+        if let resume = self.resumeData, await dio.hasExistingFiles() {
+            await pm.setCompletedBitfield(resume.completedPieces)
+            let computed = await pm.completedBytes()
+            self.totalDownloaded = max(resume.downloaded, computed)
+            self.totalUploaded = resume.uploaded
+            let isComplete = await pm.isComplete()
+            if isComplete {
+                try? await dio.finalizeFiles()
+                transitionToSeeding()
+            }
+            return
+        }
+
+        // Full disk check: if files exist on disk without resume data (e.g. torrent was re-added)
+        guard await dio.hasExistingFiles() else { return }
+
+        let previousState = state
+        state = .checkingFiles
+
+        let pieceCount = info.pieceCount
+        for i in 0..<pieceCount {
+            if let data = try? await dio.readPiece(index: i), !data.isEmpty {
+                _ = await pm.verifyPieceFromDisk(index: i, data: data)
+            }
+        }
+
+        self.totalDownloaded = await pm.completedBytes()
+
+        let isComplete = await pm.isComplete()
+        if isComplete {
+            try? await dio.finalizeFiles()
+            transitionToSeeding()
+        } else {
+            state = (previousState == .paused) ? .paused : .downloading
         }
     }
 
@@ -99,18 +142,25 @@ public actor TorrentHandle {
     internal func finishInitialization() async {
         if let info = self.info {
             await setupDownloadComponents(info: info)
+            if let pm = self.pieceManager, let dio = self.diskIO {
+                await checkExistingFilesOrResume(info: info, pm: pm, dio: dio)
+            }
         }
     }
 
     /// Start downloading.
     public func start() async throws {
-        guard state == .paused || state == .stopped else { return }
+        guard state == .paused || state == .stopped || state == .checkingFiles else { return }
 
         if info != nil {
-            state = .downloading
-            // Allocate files on disk
-            try? await diskIO?.allocateFiles()
-            startDownloadMonitor()
+            let isComplete = await pieceManager?.isComplete() ?? false
+            if isComplete {
+                state = .seeding
+            } else {
+                state = .downloading
+                try? await diskIO?.allocateFiles()
+                startDownloadMonitor()
+            }
         } else if magnetLink != nil {
             state = .downloadingMetadata
             // Set up metadata exchange
@@ -126,10 +176,11 @@ public actor TorrentHandle {
 
         // Announce to trackers
         if let trackerMgr = trackerManager {
-            let left = info?.totalSize ?? 0
+            let left = getRemainingBytes()
             let params = AnnounceParams(
-                infoHash: infoHash, peerID: peerID, port: 6881,
-                left: left - totalDownloaded, event: "started"
+                infoHash: infoHash, peerID: peerID, port: settings.listenPort,
+                uploaded: totalUploaded, downloaded: totalDownloaded,
+                left: left, event: "started"
             )
             await announceToAllTrackers(trackerMgr: trackerMgr, params: params)
             startReannounceLoop(trackerMgr: trackerMgr)
@@ -138,9 +189,18 @@ public actor TorrentHandle {
 
     private func onMetadataReceived(info: TorrentInfo) async {
         await setupDownloadComponents(info: info)
-        state = .downloading
-        try? await diskIO?.allocateFiles()
-        startDownloadMonitor()
+        if let pm = self.pieceManager, let dio = self.diskIO {
+            await checkExistingFilesOrResume(info: info, pm: pm, dio: dio)
+        }
+
+        let isComplete = await pieceManager?.isComplete() ?? false
+        if isComplete {
+            state = .seeding
+        } else {
+            state = .downloading
+            try? await diskIO?.allocateFiles()
+            startDownloadMonitor()
+        }
 
         // Resume all waiting metadata continuations
         let conts = metadataContinuations
@@ -232,7 +292,7 @@ public actor TorrentHandle {
                 let uploaded = await self.totalUploaded
                 let downloaded = await self.totalDownloaded
                 let params = AnnounceParams(
-                    infoHash: infoHash, peerID: peerID, port: 6881,
+                    infoHash: infoHash, peerID: peerID, port: self.settings.listenPort,
                     uploaded: uploaded, downloaded: downloaded,
                     left: left
                 )

@@ -177,4 +177,27 @@ public actor DiskIO {
             }
         }
     }
+
+    /// Check whether any of the torrent's files (or their .part counterparts) already exist on disk.
+    public func hasExistingFiles() async -> Bool {
+        var paths: [String] = []
+        for file in fileStorage.files {
+            if let path = try? resolvedPath(for: file.path) {
+                paths.append(path)
+            }
+        }
+        let resolvedPaths = paths
+        let usePart = self.usePartExtension
+        return (try? await threadPool.runIfActive {
+            for path in resolvedPaths {
+                if FileManager.default.fileExists(atPath: path) {
+                    return true
+                }
+                if usePart && FileManager.default.fileExists(atPath: path + ".part") {
+                    return true
+                }
+            }
+            return false
+        }) ?? false
+    }
 }

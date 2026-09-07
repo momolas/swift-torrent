@@ -156,4 +156,29 @@ public actor PieceManager {
             }
         }
     }
+
+    /// Verify a piece read from disk and mark it completed if valid.
+    public func verifyPieceFromDisk(index: Int, data: Data) -> Bool {
+        guard index >= 0 && index < pieceCount else { return false }
+        let expectedSize = expectedPieceSize(index)
+        guard data.count == expectedSize else { return false }
+
+        let expectedHash = pieceHashes.subdata(in: index * 20..<(index + 1) * 20)
+        let actualHash = Data(Insecure.SHA1.hash(data: data))
+        guard actualHash == expectedHash else { return false }
+
+        setPieceCompleted(index)
+        return true
+    }
+
+    /// Total bytes of all completed pieces.
+    public func completedBytes() -> Int64 {
+        var total: Int64 = 0
+        for i in 0..<pieceCount {
+            if completed.get(i) {
+                total += Int64(expectedPieceSize(i))
+            }
+        }
+        return total
+    }
 }

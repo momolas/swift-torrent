@@ -57,6 +57,8 @@ public actor Session {
             if !torrentName.isEmpty && torrentName != "." && torrentName != ".." && torrentName != "/" {
                 let targetURL = URL(fileURLWithPath: savePath).appendingPathComponent(torrentName)
                 try? FileManager.default.removeItem(at: targetURL)
+                let partURL = URL(fileURLWithPath: targetURL.path + ".part")
+                try? FileManager.default.removeItem(at: partURL)
             }
         }
 

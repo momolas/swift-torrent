@@ -345,6 +345,57 @@ final class TorrentHandleGetFilesTests: XCTestCase {
         XCTAssertEqual(files?.count, 1)
         XCTAssertEqual(files?.first?.path, "test")
     }
+
+    func testReAddingTorrentWithExistingFilesResumesProgress() async throws {
+        let tempDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        // Create 2 pieces of test data (16KB each = 32KB total)
+        let piece0Data = Data(repeating: 0x41, count: 16384) // 'A'
+        let piece1Data = Data(repeating: 0x42, count: 16384) // 'B'
+        let hash0 = Data(Insecure.SHA1.hash(data: piece0Data))
+        let hash1 = Data(Insecure.SHA1.hash(data: piece1Data))
+        var pieceHashes = Data()
+        pieceHashes.append(hash0)
+        pieceHashes.append(hash1)
+
+        let info = makeTorrentInfo(pieceLength: 16384, totalSize: 32768, pieceHashes: pieceHashes)
+
+        // Write piece 0 to disk (representing a partially downloaded file)
+        let targetFilePath = tempDir.appendingPathComponent("test.part").path
+        FileManager.default.createFile(atPath: targetFilePath, contents: piece0Data)
+
+        let settings = SessionSettings(listenPort: 0, savePath: tempDir.path, usePartExtension: true)
+        let session = Session(settings: settings)
+
+        // Add torrent to session
+        let params1 = AddTorrentParams(torrentInfo: info, savePath: tempDir.path, paused: true)
+        let handle1 = try await session.addTorrent(params1)
+        let status1 = await handle1.status()
+
+        // Verify that piece 0 on disk was detected and verified
+        XCTAssertEqual(status1.piecesCompleted, 1)
+        XCTAssertEqual(status1.piecesTotal, 2)
+        XCTAssertEqual(status1.progress, 0.5)
+
+        // Remove torrent from session WITHOUT deleting files
+        await session.removeTorrent(info.infoHash, deleteFiles: false)
+
+        // Verify file still exists on disk
+        XCTAssertTrue(FileManager.default.fileExists(atPath: targetFilePath))
+
+        // Re-add the same torrent to session without any resumeData
+        let params2 = AddTorrentParams(torrentInfo: info, savePath: tempDir.path, paused: true)
+        let handle2 = try await session.addTorrent(params2)
+        let status2 = await handle2.status()
+
+        // Verify that the download resumed from 50% instead of restarting from 0%
+        XCTAssertEqual(status2.piecesCompleted, 1)
+        XCTAssertEqual(status2.piecesTotal, 2)
+        XCTAssertEqual(status2.progress, 0.5)
+        XCTAssertEqual(status2.totalDownloaded, 16384)
+    }
 }
 
 // MARK: - Helpers
