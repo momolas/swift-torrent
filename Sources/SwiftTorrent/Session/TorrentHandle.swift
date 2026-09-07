@@ -82,6 +82,9 @@ public actor TorrentHandle {
         await peerManager.setOnBlockReceived { [weak self] bytes in
             Task { await self?.handleBlockReceived(bytes) }
         }
+        await peerManager.setOnBlockSent { [weak self] bytes in
+            Task { await self?.handleBlockSent(bytes) }
+        }
     }
 
     private func checkExistingFilesOrResume(info: TorrentInfo, pm: PieceManager, dio: DiskIO) async {
@@ -93,8 +96,7 @@ public actor TorrentHandle {
             self.totalUploaded = resume.uploaded
             let isComplete = await pm.isComplete()
             if isComplete {
-                try? await dio.finalizeFiles()
-                transitionToSeeding()
+                await transitionToSeeding()
             }
             return
         }
@@ -116,20 +118,25 @@ public actor TorrentHandle {
 
         let isComplete = await pm.isComplete()
         if isComplete {
-            try? await dio.finalizeFiles()
-            transitionToSeeding()
+            await transitionToSeeding()
         } else {
             state = (previousState == .paused) ? .paused : .downloading
         }
     }
 
     private func handlePieceCompleted(_ pieceIndex: Int) async {
-        // Piece verified and written to disk
+        if let pm = pieceManager, await pm.isComplete() {
+            await transitionToSeeding()
+        }
     }
 
     private func handleBlockReceived(_ bytes: Int) {
         totalDownloaded += Int64(bytes)
         downloadedBytesWindow += Int64(bytes)
+    }
+
+    private func handleBlockSent(_ bytes: Int) {
+        totalUploaded += Int64(bytes)
     }
 
     private func consumeWindowBytes() -> Int64 {
@@ -155,7 +162,7 @@ public actor TorrentHandle {
         if info != nil {
             let isComplete = await pieceManager?.isComplete() ?? false
             if isComplete {
-                state = .seeding
+                await transitionToSeeding()
             } else {
                 state = .downloading
                 try? await diskIO?.allocateFiles()
@@ -195,7 +202,7 @@ public actor TorrentHandle {
 
         let isComplete = await pieceManager?.isComplete() ?? false
         if isComplete {
-            state = .seeding
+            await transitionToSeeding()
         } else {
             state = .downloading
             try? await diskIO?.allocateFiles()
@@ -256,10 +263,29 @@ public actor TorrentHandle {
         return await pm.isComplete()
     }
 
-    private func transitionToSeeding() {
+    private func transitionToSeeding() async {
+        guard state != .seeding else { return }
         state = .seeding
         downloadRate = 0
         downloadMonitorTask?.cancel()
+
+        try? await diskIO?.finalizeFiles()
+
+        // Announce completed event to trackers
+        if let trackerMgr = trackerManager {
+            let params = AnnounceParams(
+                infoHash: infoHash, peerID: peerID, port: settings.listenPort,
+                uploaded: totalUploaded, downloaded: totalDownloaded,
+                left: 0, event: "completed"
+            )
+            Task { await announceToAllTrackers(trackerMgr: trackerMgr, params: params) }
+        }
+
+        // Broadcast complete bitfield to active peers
+        if let pm = pieceManager {
+            let bf = await pm.getCompleted()
+            await peerManager.broadcastBitfield(bf)
+        }
 
         // Resume all waiting completion continuations
         let conts = completionContinuations
@@ -353,6 +379,10 @@ public actor TorrentHandle {
     public func status() async -> TorrentStatus {
         let progress = await pieceManager?.progress() ?? 0
         let completed = await pieceManager?.getCompleted()
+        let isAllSet = completed?.allSet ?? false
+        if state == .downloading, (progress >= 1.0 || isAllSet) {
+            await transitionToSeeding()
+        }
         let name: String
         if let info = info {
             name = info.name

@@ -19,6 +19,7 @@ public actor PeerManager {
     public var metadataExchange: MetadataExchange?
     public var onPieceCompleted: ((Int) -> Void)?
     public var onBlockReceived: ((Int) -> Void)?
+    public var onBlockSent: ((Int) -> Void)?
     public var onMetadataReceived: ((TorrentInfo) -> Void)?
     private var globalPendingRequests: [PeerState.BlockRequest: String] = [:]
 
@@ -52,6 +53,10 @@ public actor PeerManager {
 
     public func setOnBlockReceived(_ handler: @escaping (Int) -> Void) {
         self.onBlockReceived = handler
+    }
+
+    public func setOnBlockSent(_ handler: @escaping (Int) -> Void) {
+        self.onBlockSent = handler
     }
 
     /// Add a peer and attempt connection.
@@ -91,6 +96,14 @@ public actor PeerManager {
         let state = PeerState(pieceCount: pc)
         await state.setAmInterested(true)
         peerStates[key] = state
+
+        // If we have pieces, send bitfield
+        if let pm = pieceManager {
+            let completedBf = await pm.getCompleted()
+            if !completedBf.isEmpty {
+                try? await conn.send(.bitfield(completedBf.toData()))
+            }
+        }
 
         // Send interested
         try? await conn.send(.interested)
@@ -151,6 +164,8 @@ public actor PeerManager {
 
         case .interested:
             await state.setPeerInterested(true)
+            await state.setAmChoking(false)
+            try? await connections[key]?.send(.unchoke)
 
         case .notInterested:
             await state.setPeerInterested(false)
@@ -189,6 +204,14 @@ public actor PeerManager {
                     onMetadataReceived?(info)
                 case .none:
                     break
+                }
+            }
+
+        case .request(let index, let begin, let length):
+            if let dio = diskIO, let pm = pieceManager, await pm.hasPiece(Int(index)) {
+                if let block = try? await dio.readBlock(pieceIndex: Int(index), offset: Int(begin), length: Int(length)), !block.isEmpty {
+                    try? await connections[key]?.send(.piece(index: index, begin: begin, block: block))
+                    onBlockSent?(block.count)
                 }
             }
 
@@ -357,6 +380,16 @@ public actor PeerManager {
     /// Broadcast a have message to all peers.
     public func broadcastHave(pieceIndex: UInt32) async {
         let msg = PeerMessage.have(pieceIndex: pieceIndex)
+        for (key, conn) in connections {
+            guard connectedPeers.contains(key) else { continue }
+            try? await conn.send(msg)
+        }
+    }
+
+    /// Broadcast our complete bitfield to all peers.
+    public func broadcastBitfield(_ bitfield: Bitfield) async {
+        guard !bitfield.isEmpty else { return }
+        let msg = PeerMessage.bitfield(bitfield.toData())
         for (key, conn) in connections {
             guard connectedPeers.contains(key) else { continue }
             try? await conn.send(msg)

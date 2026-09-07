@@ -125,6 +125,14 @@ public actor DiskIO {
         }
     }
 
+    /// Read a specific block (slice) of a piece from disk.
+    public func readBlock(pieceIndex: Int, offset: Int, length: Int) async throws -> Data {
+        let pieceData = try await readPiece(index: pieceIndex)
+        guard offset < pieceData.count else { return Data() }
+        let end = min(offset + length, pieceData.count)
+        return pieceData.subdata(in: offset..<end)
+    }
+
     /// Ensure all files exist with correct sizes (creates .part file if enabled).
     public func allocateFiles() async throws {
         var resolvedFiles: [(path: String, length: Int64)] = []
