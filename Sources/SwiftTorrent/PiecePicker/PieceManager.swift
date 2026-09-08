@@ -1,5 +1,5 @@
 import Foundation
-import Crypto
+import CryptoKit
 
 /// Tracks piece completion, block arrivals, and verifies SHA-1 hashes.
 public actor PieceManager {

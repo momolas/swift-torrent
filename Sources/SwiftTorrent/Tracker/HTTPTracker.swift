@@ -17,12 +17,14 @@ public struct HTTPTracker: Sendable {
         // Properly URL encode binary fields without double percent-encoding
         let infoHashEncoded = params.infoHash.urlEncoded
         let peerIDEncoded = params.peerID.map { byte -> String in
-            let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: ".-_~"))
-            let str = String(format: "%c", byte)
-            if let scalar = str.unicodeScalars.first, allowed.contains(scalar) {
-                return str
+            switch byte {
+            case 0x30...0x39, 0x41...0x5A, 0x61...0x7A, 0x2D, 0x2E, 0x5F, 0x7E:
+                return String(UnicodeScalar(byte))
+            default:
+                let hi = byte >> 4
+                let lo = byte & 0x0F
+                return "%" + String(hi, radix: 16).uppercased() + String(lo, radix: 16).uppercased()
             }
-            return String(format: "%%%02X", byte)
         }.joined()
 
         var queryParts = [

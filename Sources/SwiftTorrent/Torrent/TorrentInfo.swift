@@ -1,5 +1,4 @@
 import Foundation
-import Crypto
 
 /// Represents a parsed .torrent file.
 public struct TorrentInfo: Sendable, Identifiable, Equatable, Hashable {
@@ -154,11 +153,11 @@ public struct TorrentInfo: Sendable, Identifiable, Equatable, Hashable {
 
     /// Sanitize single path component preventing directory traversal attacks.
     public static func sanitizePathComponent(_ component: String) -> String {
-        var comp = component.replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: "\\", with: "_")
+        var comp = component.replacing("/", with: "_")
+            .replacing("\\", with: "_")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         while comp.contains("..") {
-            comp = comp.replacingOccurrences(of: "..", with: "_")
+            comp = comp.replacing("..", with: "_")
         }
         if comp == "." { return "_" }
         return comp

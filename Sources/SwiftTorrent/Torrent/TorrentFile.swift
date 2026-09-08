@@ -1,5 +1,5 @@
 import Foundation
-import Crypto
+import CryptoKit
 
 /// Utility for creating .torrent files.
 public struct TorrentFile: Sendable {
@@ -114,8 +114,7 @@ public struct TorrentFile: Sendable {
 
             while true {
                 let needed = pieceLength - currentPieceBuffer.count
-                let chunk = handle.readData(ofLength: needed)
-                if chunk.isEmpty { break }
+                guard let chunk = try handle.read(upToCount: needed), !chunk.isEmpty else { break }
                 currentPieceBuffer.append(chunk)
 
                 if currentPieceBuffer.count == pieceLength {

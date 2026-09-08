@@ -1,13 +1,14 @@
 import Foundation
 
 /// Current state of a torrent.
-public enum TorrentState: String, Sendable {
+public enum TorrentState: String, Sendable, Codable, Equatable {
     case checkingFiles = "checking_files"
     case downloadingMetadata = "downloading_metadata"
     case downloading
     case seeding
     case paused
     case stopped
+    case offloadedToTimeCapsule = "offloaded_to_timecapsule"
     case error
 }
 
@@ -27,4 +28,37 @@ public struct TorrentStatus: Identifiable, Equatable, Sendable {
     public let numSeeds: Int
     public let piecesCompleted: Int
     public let piecesTotal: Int
+    public let isStreaming: Bool
+
+    public init(
+        infoHash: InfoHash,
+        name: String,
+        state: TorrentState,
+        progress: Double,
+        downloadRate: Double,
+        uploadRate: Double,
+        totalDownloaded: Int64,
+        totalUploaded: Int64,
+        totalSize: Int64,
+        numPeers: Int,
+        numSeeds: Int,
+        piecesCompleted: Int,
+        piecesTotal: Int,
+        isStreaming: Bool = false
+    ) {
+        self.infoHash = infoHash
+        self.name = name
+        self.state = state
+        self.progress = progress
+        self.downloadRate = downloadRate
+        self.uploadRate = uploadRate
+        self.totalDownloaded = totalDownloaded
+        self.totalUploaded = totalUploaded
+        self.totalSize = totalSize
+        self.numPeers = numPeers
+        self.numSeeds = numSeeds
+        self.piecesCompleted = piecesCompleted
+        self.piecesTotal = piecesTotal
+        self.isStreaming = isStreaming
+    }
 }

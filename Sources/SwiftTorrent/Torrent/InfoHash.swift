@@ -1,5 +1,5 @@
 import Foundation
-import Crypto
+import CryptoKit
 
 /// A BitTorrent info hash — SHA-1 (v1) or SHA-256 (v2).
 public struct InfoHash: Hashable, Sendable, CustomStringConvertible {
@@ -12,7 +12,11 @@ public struct InfoHash: Hashable, Sendable, CustomStringConvertible {
     public let version: Version
 
     public var description: String {
-        bytes.map { String(format: "%02x", $0) }.joined()
+        bytes.map { ($0 < 16 ? "0" : "") + String($0, radix: 16) }.joined()
+    }
+
+    public var hex: String {
+        description
     }
 
     /// Create an info hash from raw bytes.
@@ -45,15 +49,17 @@ public struct InfoHash: Hashable, Sendable, CustomStringConvertible {
         self.init(bytes: data)
     }
 
-    /// URL-encoded form for tracker announces.
+    /// URL-encoded form for tracker announces (strictly RFC 3986 unreserved ASCII characters).
     public var urlEncoded: String {
         bytes.map { byte in
-            let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: ".-_~"))
-            let str = String(format: "%c", byte)
-            if let scalar = str.unicodeScalars.first, allowed.contains(scalar) {
-                return str
+            switch byte {
+            case 0x30...0x39, 0x41...0x5A, 0x61...0x7A, 0x2D, 0x2E, 0x5F, 0x7E:
+                return String(UnicodeScalar(byte))
+            default:
+                let hi = byte >> 4
+                let lo = byte & 0x0F
+                return "%" + String(hi, radix: 16).uppercased() + String(lo, radix: 16).uppercased()
             }
-            return String(format: "%%%02X", byte)
         }.joined()
     }
 }

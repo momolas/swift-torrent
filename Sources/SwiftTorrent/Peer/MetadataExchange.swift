@@ -1,5 +1,5 @@
 import Foundation
-import Crypto
+import CryptoKit
 
 /// BEP-9 ut_metadata implementation for fetching torrent metadata via magnet links.
 public actor MetadataExchange {
@@ -14,7 +14,7 @@ public actor MetadataExchange {
 
     public static let metadataPieceSize = 16384
 
-    public enum Result {
+    public enum Result: Sendable {
         case none
         case sendMessage(PeerMessage)
         case requestMore([PeerMessage])

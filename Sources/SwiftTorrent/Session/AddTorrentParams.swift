@@ -7,29 +7,31 @@ public struct AddTorrentParams: Sendable {
     public var savePath: String?
     public var resumeData: ResumeData?
     public var paused: Bool
+    public var isStreaming: Bool
 
     public init(torrentInfo: TorrentInfo? = nil, magnetLink: MagnetLink? = nil,
-                savePath: String? = nil, resumeData: ResumeData? = nil, paused: Bool = false) {
+                savePath: String? = nil, resumeData: ResumeData? = nil, paused: Bool = false, isStreaming: Bool = false) {
         self.torrentInfo = torrentInfo
         self.magnetLink = magnetLink
         self.savePath = savePath
         self.resumeData = resumeData
         self.paused = paused
+        self.isStreaming = isStreaming
     }
 
     /// Create from a .torrent file path.
-    public static func fromFile(_ path: String, savePath: String? = nil) throws -> AddTorrentParams {
+    public static func fromFile(_ path: String, savePath: String? = nil, isStreaming: Bool = false) throws -> AddTorrentParams {
         let data = try Data(contentsOf: URL(fileURLWithPath: path))
         let info = try TorrentInfo.parse(from: data)
-        return AddTorrentParams(torrentInfo: info, savePath: savePath)
+        return AddTorrentParams(torrentInfo: info, savePath: savePath, isStreaming: isStreaming)
     }
 
     /// Create from a magnet URI.
-    public static func fromMagnet(_ uri: String, savePath: String? = nil) throws -> AddTorrentParams {
+    public static func fromMagnet(_ uri: String, savePath: String? = nil, isStreaming: Bool = false) throws -> AddTorrentParams {
         guard let magnet = MagnetLink(uri: uri) else {
             throw AddTorrentError.invalidMagnetLink
         }
-        return AddTorrentParams(magnetLink: magnet, savePath: savePath)
+        return AddTorrentParams(magnetLink: magnet, savePath: savePath, isStreaming: isStreaming)
     }
 
     /// The info hash (from either torrent info or magnet link).

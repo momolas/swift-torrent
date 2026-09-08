@@ -337,7 +337,7 @@ public actor DHTNode {
 
     private func resolveHostname(_ hostname: String) async throws -> String {
         try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.global().async {
+            Task.detached(priority: .userInitiated) {
                 var hints = addrinfo()
                 hints.ai_family = AF_INET
                 hints.ai_socktype = Int32(SOCK_DGRAM)
@@ -354,7 +354,10 @@ public actor DHTNode {
                 }
                 var hostBuf = [CChar](repeating: 0, count: Int(NI_MAXHOST))
                 getnameinfo(addr, addrInfo.pointee.ai_addrlen, &hostBuf, socklen_t(NI_MAXHOST), nil, 0, NI_NUMERICHOST)
-                continuation.resume(returning: String(cString: hostBuf))
+                let host = hostBuf.withUnsafeBufferPointer { ptr in
+                    ptr.baseAddress.map { String(cString: $0) } ?? ""
+                }
+                continuation.resume(returning: host)
             }
         }
     }

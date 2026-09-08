@@ -27,7 +27,11 @@ public actor DiskIO {
 
     /// Explicitly shutdown thread pool.
     public func shutdown() async {
-        try? threadPool.syncShutdownGracefully()
+        await withCheckedContinuation { continuation in
+            threadPool.shutdownGracefully { _ in
+                continuation.resume()
+            }
+        }
     }
 
     private func resolvedPath(for slicePath: String) throws -> String {
@@ -66,11 +70,12 @@ public actor DiskIO {
     /// Write a piece to disk.
     public func writePiece(index: Int, data: Data) async throws {
         let slices = fileStorage.fileSlices(forPiece: index)
-        var resolvedSlices: [(path: String, offset: Int64, length: Int)] = []
+        var resolvedSlicesList: [(path: String, offset: Int64, length: Int)] = []
         for slice in slices {
             let path = try resolvedPath(for: slice.path)
-            resolvedSlices.append((path: path, offset: slice.offset, length: slice.length))
+            resolvedSlicesList.append((path: path, offset: slice.offset, length: slice.length))
         }
+        let resolvedSlices = resolvedSlicesList
 
         let usePart = self.usePartExtension
         try await threadPool.runIfActive {
@@ -89,7 +94,7 @@ public actor DiskIO {
                 defer { try? handle.close() }
                 try handle.seek(toOffset: UInt64(slice.offset))
                 let chunk = data.subdata(in: dataOffset..<dataOffset + slice.length)
-                handle.write(chunk)
+                try handle.write(contentsOf: chunk)
                 dataOffset += slice.length
             }
         }
@@ -98,11 +103,12 @@ public actor DiskIO {
     /// Read a piece from disk.
     public func readPiece(index: Int) async throws -> Data {
         let slices = fileStorage.fileSlices(forPiece: index)
-        var resolvedSlices: [(path: String, offset: Int64, length: Int)] = []
+        var resolvedSlicesList: [(path: String, offset: Int64, length: Int)] = []
         for slice in slices {
             let path = try resolvedPath(for: slice.path)
-            resolvedSlices.append((path: path, offset: slice.offset, length: slice.length))
+            resolvedSlicesList.append((path: path, offset: slice.offset, length: slice.length))
         }
+        let resolvedSlices = resolvedSlicesList
 
         let usePart = self.usePartExtension
         return try await threadPool.runIfActive {
@@ -115,8 +121,7 @@ public actor DiskIO {
                 let handle = try FileHandle(forReadingFrom: URL(fileURLWithPath: filePath))
                 defer { try? handle.close() }
                 try handle.seek(toOffset: UInt64(slice.offset))
-                let chunk = handle.readData(ofLength: slice.length)
-                guard chunk.count == slice.length else {
+                guard let chunk = try handle.read(upToCount: slice.length), chunk.count == slice.length else {
                     return Data()
                 }
                 result.append(chunk)
@@ -135,11 +140,12 @@ public actor DiskIO {
 
     /// Ensure all files exist with correct sizes (creates .part file if enabled).
     public func allocateFiles() async throws {
-        var resolvedFiles: [(path: String, length: Int64)] = []
+        var resolvedFilesList: [(path: String, length: Int64)] = []
         for file in fileStorage.files {
             let path = try resolvedPath(for: file.path)
-            resolvedFiles.append((path: path, length: file.length))
+            resolvedFilesList.append((path: path, length: file.length))
         }
+        let resolvedFiles = resolvedFilesList
 
         let usePart = self.usePartExtension
         try await threadPool.runIfActive {
@@ -156,9 +162,6 @@ public actor DiskIO {
                 let targetPath = usePart ? (finalPath + ".part") : finalPath
                 if !FileManager.default.fileExists(atPath: targetPath) {
                     FileManager.default.createFile(atPath: targetPath, contents: nil)
-                    let handle = try FileHandle(forWritingTo: URL(fileURLWithPath: targetPath))
-                    try handle.truncate(atOffset: UInt64(file.length))
-                    try handle.close()
                 }
             }
         }
@@ -167,11 +170,12 @@ public actor DiskIO {
     /// Finalize all completed files by renaming any .part files to their final names.
     public func finalizeFiles() async throws {
         guard usePartExtension else { return }
-        var resolvedFiles: [String] = []
+        var resolvedFilesList: [String] = []
         for file in fileStorage.files {
             let path = try resolvedPath(for: file.path)
-            resolvedFiles.append(path)
+            resolvedFilesList.append(path)
         }
+        let resolvedFiles = resolvedFilesList
 
         try await threadPool.runIfActive {
             for finalPath in resolvedFiles {

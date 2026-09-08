@@ -127,7 +127,7 @@ public final class UDPTracker: Sendable {
 
     private func resolveHostname(_ hostname: String) async throws -> String {
         try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.global().async {
+            Task.detached(priority: .userInitiated) {
                 var hints = addrinfo()
                 hints.ai_family = AF_INET
                 hints.ai_socktype = Int32(SOCK_DGRAM)
@@ -144,7 +144,10 @@ public final class UDPTracker: Sendable {
                 }
                 var hostBuf = [CChar](repeating: 0, count: Int(NI_MAXHOST))
                 getnameinfo(addr, addrInfo.pointee.ai_addrlen, &hostBuf, socklen_t(NI_MAXHOST), nil, 0, NI_NUMERICHOST)
-                continuation.resume(returning: String(cString: hostBuf))
+                let ipString = hostBuf.withUnsafeBufferPointer { ptr in
+                    String(cString: ptr.baseAddress!)
+                }
+                continuation.resume(returning: ipString)
             }
         }
     }
@@ -155,8 +158,8 @@ private final class UDPResponseHandler: ChannelInboundHandler, @unchecked Sendab
     typealias InboundIn = AddressedEnvelope<ByteBuffer>
 
     private let lock = NSLock()
-    private var continuations: [UInt64: CheckedContinuation<Data, Error>] = [:]
-    private var nextID: UInt64 = 0
+    private var continuations: [Int: CheckedContinuation<Data, any Error>] = [:]
+    private var nextID = 0
     private var receivedData: [Data] = []
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -165,49 +168,51 @@ private final class UDPResponseHandler: ChannelInboundHandler, @unchecked Sendab
         guard let bytes = buffer.readBytes(length: buffer.readableBytes) else { return }
         let responseData = Data(bytes)
 
-        lock.lock()
-        if let firstKey = continuations.keys.sorted().first {
-            let cont = continuations.removeValue(forKey: firstKey)!
-            lock.unlock()
-            cont.resume(returning: responseData)
-        } else {
-            receivedData.append(responseData)
-            lock.unlock()
+        let contToResume: CheckedContinuation<Data, any Error>? = lock.withLock {
+            if let firstKey = continuations.keys.sorted().first {
+                return continuations.removeValue(forKey: firstKey)
+            } else {
+                receivedData.append(responseData)
+                return nil
+            }
         }
+        contToResume?.resume(returning: responseData)
     }
 
     func waitForResponse(timeout: TimeAmount = .seconds(5)) async throws -> Data {
-        lock.lock()
-        if !receivedData.isEmpty {
-            let data = receivedData.removeFirst()
-            lock.unlock()
+        let existingData: Data? = lock.withLock {
+            if !receivedData.isEmpty {
+                return receivedData.removeFirst()
+            }
+            return nil
+        }
+
+        if let data = existingData {
             return data
         }
-        lock.unlock()
 
         return try await withCheckedThrowingContinuation { continuation in
-            lock.lock()
-            if !receivedData.isEmpty {
-                let data = receivedData.removeFirst()
-                lock.unlock()
-                continuation.resume(returning: data)
-            } else {
-                let id = nextID
-                nextID += 1
-                continuations[id] = continuation
-                lock.unlock()
-
-                let seconds = Double(timeout.nanoseconds) / 1_000_000_000.0
-                Task {
-                    try? await Task.sleep(for: .seconds(max(seconds, 1)))
-                    self.lock.lock()
-                    if let cont = self.continuations.removeValue(forKey: id) {
-                        self.lock.unlock()
-                        cont.resume(throwing: TrackerError.connectionFailed)
-                    } else {
-                        self.lock.unlock()
-                    }
+            let idToTimeout: Int? = lock.withLock {
+                if !receivedData.isEmpty {
+                    continuation.resume(returning: receivedData.removeFirst())
+                    return nil
+                } else {
+                    let id = nextID
+                    nextID += 1
+                    continuations[id] = continuation
+                    return id
                 }
+            }
+
+            guard let id = idToTimeout else { return }
+
+            let seconds = Double(timeout.nanoseconds) / 1_000_000_000.0
+            Task {
+                try? await Task.sleep(for: .seconds(max(seconds, 1)))
+                let contToResume = self.lock.withLock { () -> (CheckedContinuation<Data, any Error>)? in
+                    self.continuations.removeValue(forKey: id)
+                }
+                contToResume?.resume(throwing: TrackerError.connectionFailed)
             }
         }
     }

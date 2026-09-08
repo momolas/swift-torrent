@@ -77,4 +77,64 @@ public struct Bitfield: Sendable, Equatable, Hashable {
         }
         return data
     }
+    /// Convert bitfield to hex string (compatible with ROUGHCOMPUTER format).
+    public func toHex() -> String {
+        toData().map { byte in
+            let hi = byte >> 4
+            let lo = byte & 0x0F
+            return String(hi, radix: 16) + String(lo, radix: 16)
+        }.joined()
+    }
+
+    /// Compute completion ratio per cell bucket for UI grid visualization directly from this bitfield.
+    public func completion(maxCells: Int) -> [Double] {
+        guard count > 0 else { return [] }
+        let cells = min(count, max(1, maxCells))
+        var sums = [Double](repeating: 0, count: cells)
+        var totals = [Double](repeating: 0, count: cells)
+
+        for piece in 0 ..< count {
+            let cell = piece * cells / count
+            totals[cell] += 1
+            if get(piece) {
+                sums[cell] += 1
+            }
+        }
+
+        return (0 ..< cells).map { i in totals[i] > 0 ? sums[i] / totals[i] : 0 }
+    }
+
+    /// Compute completion ratio per cell bucket from hex representation.
+    public static func completion(hex: String?, count: Int, maxCells: Int) -> [Double] {
+        guard count > 0 else { return [] }
+        let cells = min(count, max(1, maxCells))
+        var sums = [Double](repeating: 0, count: cells)
+        var totals = [Double](repeating: 0, count: cells)
+        let nibbles = hex.map { h in Array(h.utf8) }
+
+        for piece in 0 ..< count {
+            let cell = piece * cells / count
+            totals[cell] += 1
+            if let nibbles, isSet(piece, in: nibbles) {
+                sums[cell] += 1
+            }
+        }
+
+        return (0 ..< cells).map { i in totals[i] > 0 ? sums[i] / totals[i] : 0 }
+    }
+
+    private static func isSet(_ piece: Int, in nibbles: [UInt8]) -> Bool {
+        let nibbleIndex = piece / 4
+        guard nibbleIndex < nibbles.count else { return false }
+        return (hexValue(nibbles[nibbleIndex]) >> (3 - piece % 4)) & 1 == 1
+    }
+
+    private static func hexValue(_ ascii: UInt8) -> Int {
+        switch ascii {
+        case 0x30 ... 0x39: return Int(ascii - 0x30)
+        case 0x61 ... 0x66: return Int(ascii - 0x61 + 10)
+        case 0x41 ... 0x46: return Int(ascii - 0x41 + 10)
+        default: return 0
+        }
+    }
 }

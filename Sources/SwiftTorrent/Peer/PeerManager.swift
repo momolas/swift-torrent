@@ -11,6 +11,8 @@ public actor PeerManager {
     private var connectedPeers: Set<String> = []
     private var peerInfos: [String: PeerInfo] = [:]
     private var peerStates: [String: PeerState] = [:]
+    private var candidatePeers: [(address: String, port: UInt16)] = []
+    private var connectingKeys: Set<String> = []
     private let maxConnections: Int
 
     public var pieceManager: PieceManager?
@@ -59,15 +61,44 @@ public actor PeerManager {
         self.onBlockSent = handler
     }
 
+    /// Enqueue multiple peer candidates and start connecting up to maxConnections.
+    public func addPeers(_ newPeers: [(String, UInt16)]) async {
+        for (addr, port) in newPeers {
+            let key = "\(addr):\(port)"
+            if connections[key] == nil && !candidatePeers.contains(where: { $0.address == addr && $0.port == port }) {
+                candidatePeers.append((address: addr, port: port))
+            }
+        }
+        await replenishConnections()
+    }
+
+    /// Replenish connection pool up to maxConnections from queued candidates.
+    public func replenishConnections() async {
+        while connections.count < maxConnections && !candidatePeers.isEmpty {
+            let candidate = candidatePeers.removeFirst()
+            await addPeer(address: candidate.address, port: candidate.port)
+        }
+    }
+
     /// Add a peer and attempt connection.
     public func addPeer(address: String, port: UInt16) async {
         let key = "\(address):\(port)"
         guard connections[key] == nil else { return }
-        guard connections.count < maxConnections else { return }
+        guard connections.count < maxConnections else {
+            if !candidatePeers.contains(where: { $0.address == address && $0.port == port }) {
+                candidatePeers.append((address: address, port: port))
+            }
+            return
+        }
+
+        let pc = pieceCount > 0 ? pieceCount : 1
+        let state = PeerState(pieceCount: pc)
+        peerStates[key] = state
 
         let conn = PeerConnection(address: address, port: port, infoHash: infoHash, peerID: peerID)
         connections[key] = conn
         peerInfos[key] = PeerInfo(id: Data(), address: address, port: port)
+        connectingKeys.insert(key)
 
         // Set up message callbacks
         conn.onMessage = { [weak self] message in
@@ -85,17 +116,17 @@ public actor PeerManager {
                 await self.onPeerConnected(key: key, conn: conn)
             } catch {
                 await self.removePeerByKey(key)
+                await self.replenishConnections()
             }
         }
     }
 
     private func onPeerConnected(key: String, conn: PeerConnection) async {
+        connectingKeys.remove(key)
         connectedPeers.insert(key)
 
-        let pc = pieceCount > 0 ? pieceCount : 1
-        let state = PeerState(pieceCount: pc)
+        guard let state = peerStates[key] else { return }
         await state.setAmInterested(true)
-        peerStates[key] = state
 
         // If we have pieces, send bitfield
         if let pm = pieceManager {
@@ -113,22 +144,21 @@ public actor PeerManager {
             let extHandshake = await metaEx.buildExtendedHandshake()
             try? await conn.send(.extended(id: 0, payload: extHandshake))
         }
+
+        // Fill piece requests immediately
+        await fillRequests(for: key)
     }
 
-    private func handleDisconnect(key: String) {
+    private func handleDisconnect(key: String) async {
         if let state = peerStates[key] {
-            Task {
-                let bf = await state.getPeerBitfield()
-                if var picker = self.piecePicker {
-                    picker.removePeerBitfield(bf)
-                    self.piecePicker = picker
-                }
+            let bf = await state.getPeerBitfield()
+            if var picker = self.piecePicker {
+                picker.removePeerBitfield(bf)
+                self.piecePicker = picker
             }
         }
-        connections.removeValue(forKey: key)
-        peerInfos.removeValue(forKey: key)
-        peerStates.removeValue(forKey: key)
-        connectedPeers.remove(key)
+        removePeerByKey(key)
+        await replenishConnections()
     }
 
     private func handleMessage(_ message: PeerMessage, from key: String) async {
@@ -334,6 +364,7 @@ public actor PeerManager {
         peerInfos.removeValue(forKey: key)
         peerStates.removeValue(forKey: key)
         connectedPeers.remove(key)
+        connectingKeys.remove(key)
         globalPendingRequests = globalPendingRequests.filter { $0.value != key }
     }
 
@@ -360,7 +391,7 @@ public actor PeerManager {
     }
 
     public var connectionCount: Int {
-        connections.count
+        connectedPeers.count > 0 ? connectedPeers.count : connections.count
     }
 
     /// Number of peers that completed the TCP handshake.

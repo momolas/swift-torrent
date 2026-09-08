@@ -35,6 +35,7 @@ public actor TorrentHandle {
     private var nextWaitID: UInt64 = 0
     private let settings: SessionSettings
     private var resumeData: ResumeData?
+    public let isStreaming: Bool
 
     public init(params: AddTorrentParams, settings: SessionSettings, group: EventLoopGroup) {
         let hash = params.infoHash!
@@ -46,6 +47,7 @@ public actor TorrentHandle {
         self.group = group
         self.settings = settings
         self.resumeData = params.resumeData
+        self.isStreaming = params.isStreaming
         self.peerManager = PeerManager(
             infoHash: hash.bytes, peerID: peerID, group: group,
             maxConnections: settings.maxConnectionsPerTorrent
@@ -60,7 +62,7 @@ public actor TorrentHandle {
     private func setupDownloadComponents(info: TorrentInfo) async {
         self.info = info
         let pm = PieceManager(info: info)
-        let pp = PiecePicker(pieceCount: info.pieceCount)
+        let pp = PiecePicker(pieceCount: info.pieceCount, isStreaming: isStreaming)
         let fs = FileStorage(info: info)
         let dio = DiskIO(basePath: savePath, fileStorage: fs, usePartExtension: settings.usePartExtension)
         self.pieceManager = pm
@@ -297,10 +299,11 @@ public actor TorrentHandle {
 
     /// Announce to all tracker tiers concurrently.
     private func announceToAllTrackers(trackerMgr: TrackerManager, params: AnnounceParams) async {
-        if let response = try? await trackerMgr.announce(params: params) {
-            for (address, port) in response.peers {
-                await peerManager.addPeer(address: address, port: port)
-            }
+        let allPeers = await trackerMgr.announceAll(params: params)
+        if !allPeers.isEmpty {
+            await peerManager.addPeers(allPeers)
+        } else if let response = try? await trackerMgr.announce(params: params) {
+            await peerManager.addPeers(response.peers)
         }
     }
 
@@ -313,8 +316,8 @@ public actor TorrentHandle {
                 guard let self, !Task.isCancelled else { break }
 
                 let left = await self.getRemainingBytes()
-                let infoHash = await self.infoHash
-                let peerID = await self.peerID
+                let infoHash = self.infoHash
+                let peerID = self.peerID
                 let uploaded = await self.totalUploaded
                 let downloaded = await self.totalDownloaded
                 let params = AnnounceParams(
@@ -322,10 +325,11 @@ public actor TorrentHandle {
                     uploaded: uploaded, downloaded: downloaded,
                     left: left
                 )
-                if let response = try? await trackerMgr.announce(params: params) {
-                    for (address, port) in response.peers {
-                        await self.peerManager.addPeer(address: address, port: port)
-                    }
+                let allPeers = await trackerMgr.announceAll(params: params)
+                if !allPeers.isEmpty {
+                    await self.peerManager.addPeers(allPeers)
+                } else if let response = try? await trackerMgr.announce(params: params) {
+                    await self.peerManager.addPeers(response.peers)
                 }
             }
         }
@@ -404,7 +408,8 @@ public actor TorrentHandle {
             numPeers: await peerManager.connectionCount,
             numSeeds: 0,
             piecesCompleted: completed?.popcount ?? 0,
-            piecesTotal: info?.pieceCount ?? 0
+            piecesTotal: info?.pieceCount ?? 0,
+            isStreaming: isStreaming
         )
     }
 
@@ -467,6 +472,20 @@ public actor TorrentHandle {
 
     private func removeMetadataContinuation(id: UInt64) -> CheckedContinuation<TorrentInfo, Error>? {
         metadataContinuations.removeValue(forKey: id)
+    }
+
+    /// Checks whether the initial stream pieces (container header and initial buffer) are ready for playback.
+    public func isStreamBufferReady() async -> Bool {
+        guard let pm = pieceManager else { return false }
+        let completed = await pm.getCompleted()
+        guard completed.count > 0 else { return false }
+        if completed.get(0) {
+            let bytes = await pm.completedBytes()
+            if completed.get(1) || completed.popcount >= 2 || bytes >= 1024 * 1024 {
+                return true
+            }
+        }
+        return false
     }
 
     /// Wait until all pieces are downloaded, or return immediately if already complete.
