@@ -16,12 +16,29 @@ public final class PeerConnection: @unchecked Sendable {
     public var onDisconnect: (@Sendable () -> Void)?
     public private(set) var remotePeerID: Data?
     public private(set) var supportsExtensions: Bool = false
+    public private(set) var supportsFastExtension: Bool = false
+    public private(set) var supportsDHT: Bool = false
 
-    public init(address: String, port: UInt16, infoHash: Data, peerID: Data) {
+    public let isPrivate: Bool
+    public let enableFastExtension: Bool
+    public let enableDHT: Bool
+
+    public init(
+        address: String,
+        port: UInt16,
+        infoHash: Data,
+        peerID: Data,
+        isPrivate: Bool = false,
+        enableFastExtension: Bool = true,
+        enableDHT: Bool = true
+    ) {
         self.address = address
         self.port = port
         self.infoHash = infoHash
         self.peerID = peerID
+        self.isPrivate = isPrivate
+        self.enableFastExtension = enableFastExtension
+        self.enableDHT = enableDHT
     }
 
     private func setChannel(_ ch: Channel) {
@@ -60,7 +77,12 @@ public final class PeerConnection: @unchecked Sendable {
         setChannel(ch)
 
         // Send handshake as raw bytes (before the encoder is in the pipeline)
-        let handshake = Handshake(infoHash: infoHash, peerID: peerID)
+        let reserved = Handshake.defaultReserved(
+            enableFastExtension: enableFastExtension,
+            enableDHT: enableDHT,
+            isPrivate: isPrivate
+        )
+        let handshake = Handshake(infoHash: infoHash, peerID: peerID, reserved: reserved)
         var buffer = ch.allocator.buffer(capacity: Handshake.length)
         buffer.writeBytes(handshake.encode())
         try await ch.writeAndFlush(buffer).get()
@@ -71,7 +93,9 @@ public final class PeerConnection: @unchecked Sendable {
         // Wait for remote handshake with timeout
         let remoteHandshake = try await decoder.waitForHandshake(timeout: .seconds(4))
         self.remotePeerID = remoteHandshake.peerID
-        self.supportsExtensions = (remoteHandshake.reserved[5] & 0x10) != 0
+        self.supportsExtensions = remoteHandshake.supportsExtensions
+        self.supportsFastExtension = enableFastExtension && remoteHandshake.supportsFastExtension
+        self.supportsDHT = enableDHT && !isPrivate && remoteHandshake.supportsDHT
 
         return ch
     }

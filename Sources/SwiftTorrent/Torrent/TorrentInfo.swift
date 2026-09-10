@@ -94,7 +94,7 @@ public struct TorrentInfo: Sendable, Identifiable, Equatable, Hashable {
             throw TorrentInfoError.invalidFormat("Missing 'pieces'")
         }
 
-        let isPrivate = infoValue["private"]?.integerValue == 1
+        let isPrivate = (infoValue["private"]?.integerValue == 1) || (infoValue["private"]?.utf8String == "1")
 
         // Parse files
         var files: [FileEntry] = []

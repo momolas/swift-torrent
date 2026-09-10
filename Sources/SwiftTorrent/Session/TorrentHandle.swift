@@ -36,8 +36,10 @@ public actor TorrentHandle {
     private let settings: SessionSettings
     private var resumeData: ResumeData?
     public let isStreaming: Bool
+    private let dhtNode: DHTNode?
+    private var dhtAnnounceTask: Task<Void, Never>?
 
-    public init(params: AddTorrentParams, settings: SessionSettings, group: EventLoopGroup) {
+    public init(params: AddTorrentParams, settings: SessionSettings, group: EventLoopGroup, dhtNode: DHTNode? = nil) {
         let hash = params.infoHash!
         self.infoHash = hash
         self.info = params.torrentInfo
@@ -48,9 +50,17 @@ public actor TorrentHandle {
         self.settings = settings
         self.resumeData = params.resumeData
         self.isStreaming = params.isStreaming
+        self.dhtNode = dhtNode
+
+        let isPriv = params.torrentInfo?.isPrivate ?? false
+        let dhtP = (!isPriv && settings.dhtEnabled) ? UInt16(settings.dhtPort) : nil
         self.peerManager = PeerManager(
-            infoHash: hash.bytes, peerID: peerID, group: group,
-            maxConnections: settings.maxConnectionsPerTorrent
+            infoHash: hash.bytes,
+            peerID: peerID,
+            group: group,
+            maxConnections: settings.maxConnectionsPerTorrent,
+            isPrivate: isPriv,
+            dhtPort: dhtP
         )
 
         if let magnet = params.magnetLink, !magnet.trackers.isEmpty {
@@ -151,6 +161,14 @@ public actor TorrentHandle {
 
     /// Complete initialization for .torrent-file init path (must be called after init).
     internal func finishInitialization() async {
+        let isPriv = info?.isPrivate ?? false
+        if let dht = dhtNode, !isPriv {
+            await peerManager.setOnDHTPortReceived { [weak dht] address, port in
+                Task {
+                    await dht?.addNode(DHTNodeEntry(id: .random(), address: address, port: port))
+                }
+            }
+        }
         if let info = self.info {
             await setupDownloadComponents(info: info)
             if let pm = self.pieceManager, let dio = self.diskIO {
@@ -196,6 +214,12 @@ public actor TorrentHandle {
             )
             await announceToAllTrackers(trackerMgr: trackerMgr, params: params)
             startReannounceLoop(trackerMgr: trackerMgr)
+        }
+
+        // Announce and discover peers on DHT (BEP-5), strictly disabled for private torrents (BEP-27)
+        let isPriv = info?.isPrivate ?? false
+        if !isPriv && settings.dhtEnabled, let dht = dhtNode {
+            startDHTLookupAndAnnounce(dhtNode: dht)
         }
     }
 
@@ -351,8 +375,10 @@ public actor TorrentHandle {
         uploadRate = 0
         reannounceTask?.cancel()
         downloadMonitorTask?.cancel()
+        dhtAnnounceTask?.cancel()
         reannounceTask = nil
         downloadMonitorTask = nil
+        dhtAnnounceTask = nil
         await peerManager.disconnectAll()
     }
 
@@ -414,8 +440,33 @@ public actor TorrentHandle {
             numSeeds: 0,
             piecesCompleted: completed?.popcount ?? 0,
             piecesTotal: info?.pieceCount ?? 0,
-            isStreaming: isStreaming
+            isStreaming: isStreaming,
+            isPrivate: info?.isPrivate ?? false
         )
+    }
+
+    private func startDHTLookupAndAnnounce(dhtNode: DHTNode) {
+        guard !(info?.isPrivate ?? false) else { return }
+        guard dhtAnnounceTask == nil else { return }
+
+        dhtAnnounceTask = Task { [weak self, weak dhtNode] in
+            guard let self, let dht = dhtNode else { return }
+            await self.queryDHTPeers(dhtNode: dht)
+
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(900))
+                guard !Task.isCancelled else { break }
+                await self.queryDHTPeers(dhtNode: dht)
+            }
+        }
+    }
+
+    private func queryDHTPeers(dhtNode: DHTNode) async {
+        guard !(info?.isPrivate ?? false) else { return }
+        let traversal = DHTTraversal(dhtNode: dhtNode)
+        if let peers = try? await traversal.getPeers(infoHash: infoHash), !peers.isEmpty {
+            await peerManager.addPeers(peers)
+        }
     }
 
     /// Returns connected peers for UI inspection.

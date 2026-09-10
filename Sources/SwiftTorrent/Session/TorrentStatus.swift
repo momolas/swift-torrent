@@ -29,6 +29,7 @@ public struct TorrentStatus: Identifiable, Equatable, Sendable {
     public let piecesCompleted: Int
     public let piecesTotal: Int
     public let isStreaming: Bool
+    public let isPrivate: Bool
 
     public init(
         infoHash: InfoHash,
@@ -44,7 +45,8 @@ public struct TorrentStatus: Identifiable, Equatable, Sendable {
         numSeeds: Int,
         piecesCompleted: Int,
         piecesTotal: Int,
-        isStreaming: Bool = false
+        isStreaming: Bool = false,
+        isPrivate: Bool = false
     ) {
         self.infoHash = infoHash
         self.name = name
@@ -60,5 +62,6 @@ public struct TorrentStatus: Identifiable, Equatable, Sendable {
         self.piecesCompleted = piecesCompleted
         self.piecesTotal = piecesTotal
         self.isStreaming = isStreaming
+        self.isPrivate = isPrivate
     }
 }

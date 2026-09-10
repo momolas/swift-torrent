@@ -9,10 +9,31 @@ public struct Handshake: Sendable, Equatable {
     public let peerID: Data     // 20 bytes
     public let reserved: Data   // 8 bytes (extension bits)
 
-    public static func defaultReserved() -> Data {
+    public static func defaultReserved(enableFastExtension: Bool = true, enableDHT: Bool = true, isPrivate: Bool = false) -> Data {
         var r = Data(count: 8)
         r[5] |= 0x10  // BEP-10 extension protocol
+        if enableFastExtension {
+            r[7] |= 0x04  // BEP-6 Fast Extension
+        }
+        if enableDHT && !isPrivate {
+            r[7] |= 0x01  // BEP-5 DHT protocol
+        }
         return r
+    }
+
+    /// Whether remote peer supports BEP-10 extension protocol.
+    public var supportsExtensions: Bool {
+        reserved.count >= 8 && (reserved[5] & 0x10) != 0
+    }
+
+    /// Whether remote peer supports BEP-6 Fast Extension.
+    public var supportsFastExtension: Bool {
+        reserved.count >= 8 && (reserved[7] & 0x04) != 0
+    }
+
+    /// Whether remote peer supports BEP-5 DHT protocol.
+    public var supportsDHT: Bool {
+        reserved.count >= 8 && (reserved[7] & 0x01) != 0
     }
 
     public init(infoHash: Data, peerID: Data, reserved: Data? = nil) {

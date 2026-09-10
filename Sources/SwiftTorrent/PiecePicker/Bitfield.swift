@@ -6,9 +6,23 @@ public struct Bitfield: Sendable, Equatable, Hashable {
     public let count: Int
 
     public init(count: Int) {
+        self.init(count: count, allSet: false)
+    }
+
+    public init(count: Int, allSet: Bool) {
         self.count = count
         let words = (count + 63) / 64
-        self.storage = [UInt64](repeating: 0, count: words)
+        if !allSet {
+            self.storage = [UInt64](repeating: 0, count: words)
+        } else {
+            var stor = [UInt64](repeating: ~0, count: words)
+            // Mask out unused trailing bits in the last word
+            let remainder = count % 64
+            if remainder != 0 && words > 0 {
+                stor[words - 1] = (1 << remainder) - 1
+            }
+            self.storage = stor
+        }
     }
 
     /// Initialize from raw bytes (network format, big-endian bit ordering).

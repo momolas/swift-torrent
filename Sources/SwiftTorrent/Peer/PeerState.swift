@@ -8,6 +8,11 @@ public actor PeerState {
     public var peerInterested: Bool = false
     public var peerBitfield: Bitfield
     public var supportsExtensions: Bool = false
+    public var supportsFastExtension: Bool = false
+    public var supportsDHT: Bool = false
+    public private(set) var allowedFastPieces: Set<Int> = []
+    public private(set) var myAllowedFastPiecesSent: Set<Int> = []
+    public private(set) var suggestedPieces: Set<Int> = []
 
     /// Pending block requests: (pieceIndex, offset, length) → timestamp
     public struct BlockRequest: Hashable, Sendable {
@@ -75,6 +80,12 @@ public actor PeerState {
         amInterested = interested
     }
 
+    public func setCapabilities(extensions: Bool, fastExtension: Bool, dht: Bool) {
+        self.supportsExtensions = extensions
+        self.supportsFastExtension = fastExtension
+        self.supportsDHT = dht
+    }
+
     public func addPendingRequest(_ request: BlockRequest) {
         pendingRequests[request] = Date()
     }
@@ -83,8 +94,43 @@ public actor PeerState {
         pendingRequests.removeValue(forKey: request)
     }
 
+    public func addAllowedFastPiece(_ pieceIndex: Int) {
+        allowedFastPieces.insert(pieceIndex)
+    }
+
+    public func isAllowedFast(_ pieceIndex: Int) -> Bool {
+        allowedFastPieces.contains(pieceIndex)
+    }
+
+    public func addMyAllowedFastPieceSent(_ pieceIndex: Int) {
+        myAllowedFastPiecesSent.insert(pieceIndex)
+    }
+
+    public func isMyAllowedFastPieceSent(_ pieceIndex: Int) -> Bool {
+        myAllowedFastPiecesSent.contains(pieceIndex)
+    }
+
+    public func addSuggestedPiece(_ pieceIndex: Int) {
+        suggestedPieces.insert(pieceIndex)
+    }
+
     public func clearPendingRequests() {
         pendingRequests.removeAll()
+    }
+
+    /// Clear pending requests whose piece is NOT in allowedFastPieces, returning the dropped requests.
+    public func clearPendingRequestsExceptAllowedFast() -> [BlockRequest] {
+        var dropped: [BlockRequest] = []
+        var remaining: [BlockRequest: Date] = [:]
+        for (req, date) in pendingRequests {
+            if allowedFastPieces.contains(req.pieceIndex) {
+                remaining[req] = date
+            } else {
+                dropped.append(req)
+            }
+        }
+        pendingRequests = remaining
+        return dropped
     }
 
     /// Returns requests older than the given timeout interval.

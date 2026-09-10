@@ -15,6 +15,13 @@ public enum PeerMessage: Equatable, Sendable {
     case port(UInt16)
     case extended(id: UInt8, payload: Data)
 
+    // BEP-6 Fast Extension messages
+    case suggestPiece(pieceIndex: UInt32)
+    case haveAll
+    case haveNone
+    case rejectRequest(index: UInt32, begin: UInt32, length: UInt32)
+    case allowedFast(pieceIndex: UInt32)
+
     // Message IDs
     public static let chokeID: UInt8 = 0
     public static let unchokeID: UInt8 = 1
@@ -26,6 +33,11 @@ public enum PeerMessage: Equatable, Sendable {
     public static let pieceID: UInt8 = 7
     public static let cancelID: UInt8 = 8
     public static let portID: UInt8 = 9
+    public static let suggestPieceID: UInt8 = 13
+    public static let haveAllID: UInt8 = 14
+    public static let haveNoneID: UInt8 = 15
+    public static let rejectRequestID: UInt8 = 16
+    public static let allowedFastID: UInt8 = 17
     public static let extendedID: UInt8 = 20
 
     /// Serialize to wire format: <length prefix><message ID><payload>
@@ -87,6 +99,31 @@ public enum PeerMessage: Equatable, Sendable {
             data.append(Self.portID)
             data.append(contentsOf: port.bigEndianBytes)
 
+        case .suggestPiece(let index):
+            data.append(contentsOf: UInt32(5).bigEndianBytes)
+            data.append(Self.suggestPieceID)
+            data.append(contentsOf: index.bigEndianBytes)
+
+        case .haveAll:
+            data.append(contentsOf: UInt32(1).bigEndianBytes)
+            data.append(Self.haveAllID)
+
+        case .haveNone:
+            data.append(contentsOf: UInt32(1).bigEndianBytes)
+            data.append(Self.haveNoneID)
+
+        case .rejectRequest(let index, let begin, let length):
+            data.append(contentsOf: UInt32(13).bigEndianBytes)
+            data.append(Self.rejectRequestID)
+            data.append(contentsOf: index.bigEndianBytes)
+            data.append(contentsOf: begin.bigEndianBytes)
+            data.append(contentsOf: length.bigEndianBytes)
+
+        case .allowedFast(let index):
+            data.append(contentsOf: UInt32(5).bigEndianBytes)
+            data.append(Self.allowedFastID)
+            data.append(contentsOf: index.bigEndianBytes)
+
         case .extended(let id, let payload):
             data.append(contentsOf: UInt32(2 + UInt32(payload.count)).bigEndianBytes)
             data.append(Self.extendedID)
@@ -143,6 +180,28 @@ public enum PeerMessage: Equatable, Sendable {
         case portID:
             guard rest.count >= 2 else { throw PeerMessageError.invalidPayload }
             return .port(rest.readUInt16BE(at: 0))
+
+        case suggestPieceID:
+            guard rest.count >= 4 else { throw PeerMessageError.invalidPayload }
+            return .suggestPiece(pieceIndex: rest.readUInt32BE(at: 0))
+
+        case haveAllID:
+            return .haveAll
+
+        case haveNoneID:
+            return .haveNone
+
+        case rejectRequestID:
+            guard rest.count >= 12 else { throw PeerMessageError.invalidPayload }
+            return .rejectRequest(
+                index: rest.readUInt32BE(at: 0),
+                begin: rest.readUInt32BE(at: 4),
+                length: rest.readUInt32BE(at: 8)
+            )
+
+        case allowedFastID:
+            guard rest.count >= 4 else { throw PeerMessageError.invalidPayload }
+            return .allowedFast(pieceIndex: rest.readUInt32BE(at: 0))
 
         case extendedID:
             guard rest.count >= 1 else { throw PeerMessageError.invalidPayload }

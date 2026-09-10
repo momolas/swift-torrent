@@ -23,15 +23,33 @@ public actor PeerManager {
     public var onBlockReceived: ((Int) -> Void)?
     public var onBlockSent: ((Int) -> Void)?
     public var onMetadataReceived: ((TorrentInfo) -> Void)?
+    public var onDHTPortReceived: ((String, UInt16) -> Void)?
     private var globalPendingRequests: [PeerState.BlockRequest: String] = [:]
+
+    public let isPrivate: Bool
+    public var dhtPort: UInt16?
+    private var remotePexIDs: [String: UInt8] = [:]
+    private var pexAddedSinceLast: Set<PeerExchange.PeerEntry> = []
+    private var pexDroppedSinceLast: Set<PeerExchange.PeerEntry> = []
+    private var pexBroadcastTask: Task<Void, Never>?
+    private let localPexID: UInt8 = PeerExchange.defaultLocalExtensionID
 
     private var pieceCount: Int = 0
 
-    public init(infoHash: Data, peerID: Data, group: EventLoopGroup, maxConnections: Int = 50) {
+    public init(
+        infoHash: Data,
+        peerID: Data,
+        group: EventLoopGroup,
+        maxConnections: Int = 50,
+        isPrivate: Bool = false,
+        dhtPort: UInt16? = nil
+    ) {
         self.infoHash = infoHash
         self.peerID = peerID
         self.group = group
         self.maxConnections = maxConnections
+        self.isPrivate = isPrivate
+        self.dhtPort = dhtPort
     }
 
     public func configure(pieceManager: PieceManager, piecePicker: PiecePicker, diskIO: DiskIO, pieceCount: Int) {
@@ -59,6 +77,10 @@ public actor PeerManager {
 
     public func setOnBlockSent(_ handler: @escaping (Int) -> Void) {
         self.onBlockSent = handler
+    }
+
+    public func setOnDHTPortReceived(_ handler: @escaping (String, UInt16) -> Void) {
+        self.onDHTPortReceived = handler
     }
 
     /// Enqueue multiple peer candidates and start connecting up to maxConnections.
@@ -95,7 +117,15 @@ public actor PeerManager {
         let state = PeerState(pieceCount: pc)
         peerStates[key] = state
 
-        let conn = PeerConnection(address: address, port: port, infoHash: infoHash, peerID: peerID)
+        let conn = PeerConnection(
+            address: address,
+            port: port,
+            infoHash: infoHash,
+            peerID: peerID,
+            isPrivate: isPrivate,
+            enableFastExtension: true,
+            enableDHT: !isPrivate
+        )
         connections[key] = conn
         peerInfos[key] = PeerInfo(id: Data(), address: address, port: port)
         connectingKeys.insert(key)
@@ -115,7 +145,7 @@ public actor PeerManager {
                 let _ = try await conn.connect(on: group)
                 await self.onPeerConnected(key: key, conn: conn)
             } catch {
-                await self.removePeerByKey(key)
+                self.removePeerByKey(key)
                 await self.replenishConnections()
             }
         }
@@ -126,30 +156,89 @@ public actor PeerManager {
         connectedPeers.insert(key)
 
         guard let state = peerStates[key] else { return }
+        await state.setCapabilities(
+            extensions: conn.supportsExtensions,
+            fastExtension: conn.supportsFastExtension,
+            dht: conn.supportsDHT
+        )
         await state.setAmInterested(true)
 
-        // If we have pieces, send bitfield
-        if let pm = pieceManager {
-            let completedBf = await pm.getCompleted()
-            if !completedBf.isEmpty {
-                try? await conn.send(.bitfield(completedBf.toData()))
+        // 1. BEP-6 Fast Extension or BEP-3 Bitfield
+        if conn.supportsFastExtension {
+            if let pm = pieceManager {
+                let isComplete = await pm.isComplete()
+                let completedBf = await pm.getCompleted()
+                if isComplete {
+                    try? await conn.send(.haveAll)
+                } else if completedBf.isEmpty {
+                    try? await conn.send(.haveNone)
+                } else {
+                    try? await conn.send(.bitfield(completedBf.toData()))
+                }
+            }
+            if pieceCount > 0 {
+                let fastSet = FastExtension.generateFastSet(
+                    k: min(10, pieceCount),
+                    pieceCount: pieceCount,
+                    infoHash: infoHash,
+                    ip: conn.address
+                )
+                for pieceIdx in fastSet {
+                    try? await conn.send(.allowedFast(pieceIndex: UInt32(pieceIdx)))
+                    await state.addMyAllowedFastPieceSent(pieceIdx)
+                }
+            }
+        } else {
+            if let pm = pieceManager {
+                let completedBf = await pm.getCompleted()
+                if !completedBf.isEmpty {
+                    try? await conn.send(.bitfield(completedBf.toData()))
+                }
             }
         }
 
-        // Send interested
-        try? await conn.send(.interested)
-
-        // If peer supports extensions and we need metadata, send extended handshake
-        if conn.supportsExtensions, let metaEx = metadataExchange {
-            let extHandshake = await metaEx.buildExtendedHandshake()
-            try? await conn.send(.extended(id: 0, payload: extHandshake))
+        // 2. BEP-5 DHT Port message
+        if conn.supportsDHT && !isPrivate, let port = dhtPort {
+            try? await conn.send(.port(port))
         }
 
-        // Fill piece requests immediately
+        // 3. Send interested
+        try? await conn.send(.interested)
+
+        // 4. BEP-10 Extended Handshake (ut_metadata and ut_pex)
+        if conn.supportsExtensions {
+            var mDict: [(key: Data, value: BencodeValue)] = []
+            if metadataExchange != nil {
+                mDict.append((key: Data("ut_metadata".utf8), value: .integer(1)))
+            }
+            if !isPrivate {
+                mDict.append((key: Data(PeerExchange.extensionName.utf8), value: .integer(Int64(localPexID))))
+            }
+            if !mDict.isEmpty {
+                let msg = BencodeValue.dictionary([
+                    (key: Data("m".utf8), value: .dictionary(mDict))
+                ])
+                let payload = BencodeEncoder().encode(msg)
+                try? await conn.send(.extended(id: 0, payload: payload))
+            }
+        }
+
+        // 5. BEP-11 PEX tracking
+        if !isPrivate {
+            let isSeed = await pieceManager?.isComplete() ?? false
+            pexAddedSinceLast.insert(PeerExchange.PeerEntry(address: conn.address, port: conn.port, isSeed: isSeed))
+            startPEXLoop()
+        }
+
+        // 6. Fill piece requests immediately
         await fillRequests(for: key)
     }
 
     private func handleDisconnect(key: String) async {
+        remotePexIDs.removeValue(forKey: key)
+        if !isPrivate, let info = peerInfos[key] {
+            pexDroppedSinceLast.insert(PeerExchange.PeerEntry(address: info.address, port: info.port))
+        }
         if let state = peerStates[key] {
             let bf = await state.getPeerBitfield()
             if var picker = self.piecePicker {
@@ -184,9 +273,21 @@ public actor PeerManager {
             }
             await fillRequests(for: key)
 
+        case .port(let dhtPort):
+            if !isPrivate, let info = peerInfos[key] {
+                onDHTPortReceived?(info.address, dhtPort)
+            }
+
         case .choke:
             await state.setPeerChoking(true)
-            await state.clearPendingRequests()
+            if connections[key]?.supportsFastExtension == true {
+                let dropped = await state.clearPendingRequestsExceptAllowedFast()
+                for req in dropped {
+                    globalPendingRequests.removeValue(forKey: req)
+                }
+            } else {
+                await state.clearPendingRequests()
+            }
 
         case .unchoke:
             await state.setPeerChoking(false)
@@ -199,6 +300,36 @@ public actor PeerManager {
 
         case .notInterested:
             await state.setPeerInterested(false)
+
+        case .haveAll:
+            let count = pieceCount > 0 ? pieceCount : 1
+            let bf = Bitfield(count: count, allSet: true)
+            await state.setPeerBitfield(bf)
+            if var picker = piecePicker {
+                picker.addPeerBitfield(bf)
+                piecePicker = picker
+            }
+            peerInfos[key]?.peerBitfield = bf
+            await fillRequests(for: key)
+
+        case .haveNone:
+            let count = pieceCount > 0 ? pieceCount : 1
+            let bf = Bitfield(count: count, allSet: false)
+            await state.setPeerBitfield(bf)
+            peerInfos[key]?.peerBitfield = bf
+
+        case .suggestPiece(let pieceIndex):
+            await state.addSuggestedPiece(Int(pieceIndex))
+
+        case .allowedFast(let pieceIndex):
+            await state.addAllowedFastPiece(Int(pieceIndex))
+            await fillRequests(for: key)
+
+        case .rejectRequest(let index, let begin, let length):
+            let req = PeerState.BlockRequest(pieceIndex: Int(index), offset: Int(begin), length: Int(length))
+            await state.removePendingRequest(req)
+            globalPendingRequests.removeValue(forKey: req)
+            await fillRequests(for: key)
 
         case .piece(let index, let begin, let block):
             let pieceIndex = Int(index)
@@ -221,32 +352,90 @@ public actor PeerManager {
             await fillRequests(for: key)
 
         case .extended(let extID, let payload):
-            if let metaEx = metadataExchange {
-                let result = await metaEx.handleExtendedMessage(id: extID, payload: payload)
-                switch result {
-                case .sendMessage(let msg):
-                    try? await connections[key]?.send(msg)
-                case .requestMore(let messages):
-                    for msg in messages {
-                        try? await connections[key]?.send(msg)
+            if extID == 0 {
+                // Extended handshake (BEP-10)
+                let decoder = BencodeDecoder()
+                if let value = try? decoder.decode(payload), let m = value["m"] {
+                    if let utPex = m[PeerExchange.extensionName]?.integerValue {
+                        remotePexIDs[key] = UInt8(utPex)
                     }
-                case .metadataComplete(let info):
-                    onMetadataReceived?(info)
-                case .none:
-                    break
                 }
+                if let metaEx = metadataExchange {
+                    let result = await metaEx.handleExtendedMessage(id: extID, payload: payload)
+                    await processMetadataResult(result, key: key)
+                }
+            } else if extID == localPexID {
+                // Inbound PEX message (BEP-11)
+                if !isPrivate {
+                    let decoded = PeerExchange.decode(payload: payload)
+                    await addPeers(decoded.added.map { ($0.address, $0.port) })
+                }
+            } else if let metaEx = metadataExchange {
+                let result = await metaEx.handleExtendedMessage(id: extID, payload: payload)
+                await processMetadataResult(result, key: key)
             }
 
         case .request(let index, let begin, let length):
-            if let dio = diskIO, let pm = pieceManager, await pm.hasPiece(Int(index)) {
-                if let block = try? await dio.readBlock(pieceIndex: Int(index), offset: Int(begin), length: Int(length)), !block.isEmpty {
+            let pIndex = Int(index)
+            let isAmChoking = await state.amChoking
+            let isFast = connections[key]?.supportsFastExtension == true
+            let isAllowedFastByUs = await state.isMyAllowedFastPieceSent(pIndex)
+            let canServe = !isAmChoking || (isFast && isAllowedFastByUs)
+
+            if canServe, let dio = diskIO, let pm = pieceManager, await pm.hasPiece(pIndex) {
+                if let block = try? await dio.readBlock(pieceIndex: pIndex, offset: Int(begin), length: Int(length)), !block.isEmpty {
                     try? await connections[key]?.send(.piece(index: index, begin: begin, block: block))
                     onBlockSent?(block.count)
                 }
+            } else if isFast {
+                try? await connections[key]?.send(.rejectRequest(index: index, begin: begin, length: length))
             }
 
         default:
             break
+        }
+    }
+
+    private func processMetadataResult(_ result: MetadataExchange.Result, key: String) async {
+        switch result {
+        case .sendMessage(let msg):
+            try? await connections[key]?.send(msg)
+        case .requestMore(let messages):
+            for msg in messages {
+                try? await connections[key]?.send(msg)
+            }
+        case .metadataComplete(let info):
+            onMetadataReceived?(info)
+        case .none:
+            break
+        }
+    }
+
+    /// Periodic loop broadcasting BEP-11 Peer Exchange updates.
+    public func startPEXLoop() {
+        guard !isPrivate, pexBroadcastTask == nil else { return }
+        pexBroadcastTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(60))
+                guard let self else { break }
+                await self.broadcastPEX()
+            }
+        }
+    }
+
+    private func broadcastPEX() async {
+        guard !isPrivate else { return }
+        let addedList = Array(pexAddedSinceLast)
+        let droppedList = Array(pexDroppedSinceLast)
+        pexAddedSinceLast.removeAll()
+        pexDroppedSinceLast.removeAll()
+
+        guard !addedList.isEmpty || !droppedList.isEmpty else { return }
+        let payload = PeerExchange.encode(added: addedList, dropped: droppedList)
+
+        for (key, remoteID) in remotePexIDs {
+            guard let conn = connections[key] else { continue }
+            try? await conn.send(.extended(id: remoteID, payload: payload))
         }
     }
 
@@ -256,7 +445,11 @@ public actor PeerManager {
               let conn = connections[key] else { return }
 
         let peerChoking = await state.getPeerChoking()
-        guard !peerChoking else { return }
+        let allowedFast = await state.allowedFastPieces
+        let isFast = conn.supportsFastExtension
+
+        // If choked and not fast extension, or choked and no allowed fast pieces, cannot request
+        if peerChoking && (!isFast || allowedFast.isEmpty) { return }
 
         let completed = await pm.getCompleted()
         let inProgress = await pm.getInProgress()
@@ -267,29 +460,43 @@ public actor PeerManager {
         while await state.canRequest {
             var targetPiece: Int? = nil
 
-            // 1. Try unfinished pieces in progress first that this peer has
-            for inProgIdx in inProgress {
-                if !completed.get(inProgIdx) && peerBF.get(inProgIdx) && !triedPieces.contains(inProgIdx) {
-                    if !(await isPieceFullyRequested(inProgIdx, pieceManager: pm)) {
-                        targetPiece = inProgIdx
-                        break
-                    } else {
-                        triedPieces.insert(inProgIdx)
+            if peerChoking {
+                // When choked, we can ONLY request pieces that the peer marked as Allowed Fast
+                for afPiece in allowedFast {
+                    if !completed.get(afPiece) && peerBF.get(afPiece) && !triedPieces.contains(afPiece) {
+                        if !(await isPieceFullyRequested(afPiece, pieceManager: pm)) {
+                            targetPiece = afPiece
+                            break
+                        } else {
+                            triedPieces.insert(afPiece)
+                        }
                     }
                 }
-            }
+            } else {
+                // 1. Try unfinished pieces in progress first that this peer has
+                for inProgIdx in inProgress {
+                    if !completed.get(inProgIdx) && peerBF.get(inProgIdx) && !triedPieces.contains(inProgIdx) {
+                        if !(await isPieceFullyRequested(inProgIdx, pieceManager: pm)) {
+                            targetPiece = inProgIdx
+                            break
+                        } else {
+                            triedPieces.insert(inProgIdx)
+                        }
+                    }
+                }
 
-            // 2. Otherwise pick a new piece with rarest-first
-            if targetPiece == nil, let picker = piecePicker {
-                var tempHave = completed
-                for tried in triedPieces {
-                    tempHave.set(tried)
-                }
-                for inProg in inProgress {
-                    tempHave.set(inProg)
-                }
-                if let picked = picker.pick(have: tempHave, peerHas: peerBF) {
-                    targetPiece = picked
+                // 2. Otherwise pick a new piece with rarest-first
+                if targetPiece == nil, let picker = piecePicker {
+                    var tempHave = completed
+                    for tried in triedPieces {
+                        tempHave.set(tried)
+                    }
+                    for inProg in inProgress {
+                        tempHave.set(inProg)
+                    }
+                    if let picked = picker.pick(have: tempHave, peerHas: peerBF) {
+                        targetPiece = picked
+                    }
                 }
             }
 
@@ -324,7 +531,7 @@ public actor PeerManager {
                         length: UInt32(length)
                     ))
                 }
-                offset += blockSize
+                offset += length
             }
         }
     }
@@ -443,6 +650,8 @@ public actor PeerManager {
 
     /// Disconnect all active peers and release resources.
     public func disconnectAll() async {
+        pexBroadcastTask?.cancel()
+        pexBroadcastTask = nil
         for conn in connections.values {
             try? await conn.close()
         }
@@ -451,5 +660,6 @@ public actor PeerManager {
         peerStates.removeAll()
         connectedPeers.removeAll()
         globalPendingRequests.removeAll()
+        remotePexIDs.removeAll()
     }
 }

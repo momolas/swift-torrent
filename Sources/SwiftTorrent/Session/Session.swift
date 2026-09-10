@@ -29,7 +29,11 @@ public actor Session {
             return existing
         }
 
-        let handle = TorrentHandle(params: params, settings: settings, group: group)
+        if settings.dhtEnabled && dhtNode == nil {
+            try? await startDHT()
+        }
+
+        let handle = TorrentHandle(params: params, settings: settings, group: group, dhtNode: dhtNode)
         await handle.finishInitialization()
         torrents[hash] = handle
 
