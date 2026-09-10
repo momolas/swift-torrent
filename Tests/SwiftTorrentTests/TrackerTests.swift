@@ -39,4 +39,23 @@ final class TrackerTests: XCTestCase {
         let decoded = try BencodeDecoder().decode(data)
         XCTAssertEqual(decoded["failure reason"]?.utf8String, "Torrent not found")
     }
+
+    func testBencodeErrorLocalizedDescriptions() {
+        let err = BencodeError.unexpectedEnd
+        XCTAssertEqual(err.localizedDescription, "Unexpected end of bencoded data (empty or incomplete response)")
+
+        let formatErr = BencodeError.invalidFormat("bad byte")
+        XCTAssertEqual(formatErr.localizedDescription, "Invalid bencode format: bad byte")
+    }
+
+    func testTrackerErrorLocalizedDescriptions() {
+        let emptyErr = TrackerError.emptyResponse
+        XCTAssertEqual(emptyErr.localizedDescription, "Tracker returned an empty response")
+
+        let httpErr = TrackerError.httpStatus(403, "Forbidden")
+        XCTAssertEqual(httpErr.localizedDescription, "Tracker HTTP error 403: Forbidden")
+
+        let failErr = TrackerError.failure("unregistered torrent")
+        XCTAssertEqual(failErr.localizedDescription, "unregistered torrent")
+    }
 }

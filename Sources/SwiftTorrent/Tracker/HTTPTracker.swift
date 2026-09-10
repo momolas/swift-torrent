@@ -52,7 +52,35 @@ public struct HTTPTracker: Sendable {
             throw TrackerError.invalidURL
         }
 
-        let (data, _) = try await URLSession.shared.data(from: url)
+        var request = URLRequest(url: url)
+        request.setValue("SwiftTorrent/1.0 (Macintosh; OS X)", forHTTPHeaderField: "User-Agent")
+        request.setValue("*/*", forHTTPHeaderField: "Accept")
+        request.setValue("gzip, deflate", forHTTPHeaderField: "Accept-Encoding")
+        request.timeoutInterval = 15
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw TrackerError.invalidResponse
+        }
+
+        if data.isEmpty {
+            if !(200...299).contains(httpResponse.statusCode) {
+                let statusText = HTTPURLResponse.localizedString(forStatusCode: httpResponse.statusCode)
+                throw TrackerError.httpStatus(httpResponse.statusCode, statusText)
+            }
+            throw TrackerError.emptyResponse
+        }
+
+        if !(200...299).contains(httpResponse.statusCode) {
+            if let bencode = try? BencodeDecoder().decode(data),
+               let reason = bencode["failure reason"]?.utf8String {
+                throw TrackerError.failure(reason)
+            }
+            let statusText = HTTPURLResponse.localizedString(forStatusCode: httpResponse.statusCode)
+            throw TrackerError.httpStatus(httpResponse.statusCode, statusText)
+        }
+
         return try parseAnnounceResponse(data)
     }
 
@@ -80,9 +108,46 @@ public struct HTTPTracker: Sendable {
             throw TrackerError.invalidURL
         }
 
-        let (data, _) = try await URLSession.shared.data(from: url)
+        var request = URLRequest(url: url)
+        request.setValue("SwiftTorrent/1.0 (Macintosh; OS X)", forHTTPHeaderField: "User-Agent")
+        request.setValue("*/*", forHTTPHeaderField: "Accept")
+        request.setValue("gzip, deflate", forHTTPHeaderField: "Accept-Encoding")
+        request.timeoutInterval = 15
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw TrackerError.invalidResponse
+        }
+
+        if data.isEmpty {
+            if !(200...299).contains(httpResponse.statusCode) {
+                let statusText = HTTPURLResponse.localizedString(forStatusCode: httpResponse.statusCode)
+                throw TrackerError.httpStatus(httpResponse.statusCode, statusText)
+            }
+            throw TrackerError.emptyResponse
+        }
+
+        if !(200...299).contains(httpResponse.statusCode) {
+            if let bencode = try? BencodeDecoder().decode(data),
+               let reason = bencode["failure reason"]?.utf8String {
+                throw TrackerError.failure(reason)
+            }
+            let statusText = HTTPURLResponse.localizedString(forStatusCode: httpResponse.statusCode)
+            throw TrackerError.httpStatus(httpResponse.statusCode, statusText)
+        }
+
         let decoder = BencodeDecoder()
-        let value = try decoder.decode(data)
+        let value: BencodeValue
+        do {
+            value = try decoder.decode(data)
+        } catch {
+            if let str = String(data: data.prefix(200), encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+               str.hasPrefix("<") || str.lowercased().hasPrefix("<!doctype") {
+                throw TrackerError.failure("Tracker returned HTML instead of bencode")
+            }
+            throw error
+        }
 
         if let failure = value["failure reason"]?.utf8String {
             throw TrackerError.failure(failure)
@@ -111,8 +176,21 @@ public struct HTTPTracker: Sendable {
     }
 
     private func parseAnnounceResponse(_ data: Data) throws -> AnnounceResponse {
+        guard !data.isEmpty else {
+            throw TrackerError.emptyResponse
+        }
+
         let decoder = BencodeDecoder()
-        let value = try decoder.decode(data)
+        let value: BencodeValue
+        do {
+            value = try decoder.decode(data)
+        } catch {
+            if let str = String(data: data.prefix(200), encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+               str.hasPrefix("<") || str.lowercased().hasPrefix("<!doctype") {
+                throw TrackerError.failure("Tracker returned HTML instead of bencode")
+            }
+            throw error
+        }
 
         if let failure = value["failure reason"]?.utf8String {
             throw TrackerError.failure(failure)
@@ -141,6 +219,23 @@ public struct HTTPTracker: Sendable {
                    let port = peerValue["port"]?.integerValue {
                     peers.append((ip, UInt16(port)))
                 }
+            }
+        }
+
+        if let peers6Data = value["peers6"]?.stringValue {
+            // BEP-7: Compact IPv6 format (18 bytes per peer: 16 bytes IPv6 + 2 bytes port)
+            var offset = 0
+            while offset + 18 <= peers6Data.count {
+                let start = peers6Data.startIndex + offset
+                var ipSegments: [String] = []
+                for i in stride(from: 0, to: 16, by: 2) {
+                    let seg = (UInt16(peers6Data[start + i]) << 8) | UInt16(peers6Data[start + i + 1])
+                    ipSegments.append(String(seg, radix: 16))
+                }
+                let ip = ipSegments.joined(separator: ":")
+                let port = (UInt16(peers6Data[start + 16]) << 8) | UInt16(peers6Data[start + 17])
+                peers.append((ip, port))
+                offset += 18
             }
         }
 
@@ -193,9 +288,28 @@ public struct AnnounceResponse: Sendable {
     public let peers: [(String, UInt16)]
 }
 
-public enum TrackerError: Error, Equatable {
+public enum TrackerError: Error, Equatable, LocalizedError {
     case invalidURL
     case failure(String)
     case invalidResponse
     case connectionFailed
+    case emptyResponse
+    case httpStatus(Int, String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidURL:
+            return "Invalid tracker URL"
+        case .failure(let reason):
+            return reason
+        case .invalidResponse:
+            return "Invalid tracker response format"
+        case .connectionFailed:
+            return "Could not connect to tracker"
+        case .emptyResponse:
+            return "Tracker returned an empty response"
+        case .httpStatus(let code, let msg):
+            return "Tracker HTTP error \(code): \(msg)"
+        }
+    }
 }

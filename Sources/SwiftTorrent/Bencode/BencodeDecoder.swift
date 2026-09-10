@@ -1,11 +1,26 @@
 import Foundation
 
-public enum BencodeError: Error, Equatable {
+public enum BencodeError: Error, Equatable, LocalizedError {
     case unexpectedEnd
     case invalidFormat(String)
     case invalidInteger
     case invalidStringLength
     case invalidDictionaryKey
+
+    public var errorDescription: String? {
+        switch self {
+        case .unexpectedEnd:
+            return "Unexpected end of bencoded data (empty or incomplete response)"
+        case .invalidFormat(let msg):
+            return "Invalid bencode format: \(msg)"
+        case .invalidInteger:
+            return "Invalid bencode integer"
+        case .invalidStringLength:
+            return "Invalid bencode string length"
+        case .invalidDictionaryKey:
+            return "Invalid bencode dictionary key"
+        }
+    }
 }
 
 public struct BencodeDecoder: Sendable {
