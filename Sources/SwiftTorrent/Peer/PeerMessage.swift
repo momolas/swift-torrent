@@ -1,6 +1,6 @@
 import Foundation
 
-/// All peer wire protocol messages (BEP-3).
+/// All peer wire protocol messages (BEP-3, BEP-6, BEP-52).
 public enum PeerMessage: Equatable, Sendable {
     case keepAlive
     case choke
@@ -22,6 +22,14 @@ public enum PeerMessage: Equatable, Sendable {
     case rejectRequest(index: UInt32, begin: UInt32, length: UInt32)
     case allowedFast(pieceIndex: UInt32)
 
+    // BEP-52 BitTorrent v2 messages
+    /// Hash Request: request a Merkle hash proof for a given file, piece, offset range, and proof layers.
+    case hashRequest(piecesRoot: Data, baseLayer: UInt32, index: UInt32, length: UInt32, proofLayers: UInt32)
+    /// Hash Reject: reject a hash request.
+    case hashReject(piecesRoot: Data, baseLayer: UInt32, index: UInt32, length: UInt32, proofLayers: UInt32)
+    /// Hashes: response containing Merkle tree hashes for a file/piece.
+    case hashes(piecesRoot: Data, baseLayer: UInt32, index: UInt32, length: UInt32, proofLayers: UInt32, hashes: Data)
+
     // Message IDs
     public static let chokeID: UInt8 = 0
     public static let unchokeID: UInt8 = 1
@@ -39,6 +47,9 @@ public enum PeerMessage: Equatable, Sendable {
     public static let rejectRequestID: UInt8 = 16
     public static let allowedFastID: UInt8 = 17
     public static let extendedID: UInt8 = 20
+    public static let hashRequestID: UInt8 = 21
+    public static let hashesID: UInt8 = 22
+    public static let hashRejectID: UInt8 = 23
 
     /// Serialize to wire format: <length prefix><message ID><payload>
     public func encode() -> Data {
@@ -129,6 +140,37 @@ public enum PeerMessage: Equatable, Sendable {
             data.append(Self.extendedID)
             data.append(id)
             data.append(payload)
+
+        // BEP-52 messages
+        case .hashRequest(let piecesRoot, let baseLayer, let index, let length, let proofLayers):
+            // payload: 32-byte root + 4x UInt32 = 32 + 16 = 48 bytes + 1 ID
+            data.append(contentsOf: UInt32(49).bigEndianBytes)
+            data.append(Self.hashRequestID)
+            data.append(piecesRoot)
+            data.append(contentsOf: baseLayer.bigEndianBytes)
+            data.append(contentsOf: index.bigEndianBytes)
+            data.append(contentsOf: length.bigEndianBytes)
+            data.append(contentsOf: proofLayers.bigEndianBytes)
+
+        case .hashReject(let piecesRoot, let baseLayer, let index, let length, let proofLayers):
+            data.append(contentsOf: UInt32(49).bigEndianBytes)
+            data.append(Self.hashRejectID)
+            data.append(piecesRoot)
+            data.append(contentsOf: baseLayer.bigEndianBytes)
+            data.append(contentsOf: index.bigEndianBytes)
+            data.append(contentsOf: length.bigEndianBytes)
+            data.append(contentsOf: proofLayers.bigEndianBytes)
+
+        case .hashes(let piecesRoot, let baseLayer, let index, let length, let proofLayers, let hashes):
+            let payloadLen = UInt32(49 + hashes.count)
+            data.append(contentsOf: payloadLen.bigEndianBytes)
+            data.append(Self.hashesID)
+            data.append(piecesRoot)
+            data.append(contentsOf: baseLayer.bigEndianBytes)
+            data.append(contentsOf: index.bigEndianBytes)
+            data.append(contentsOf: length.bigEndianBytes)
+            data.append(contentsOf: proofLayers.bigEndianBytes)
+            data.append(hashes)
         }
         return data
     }
@@ -207,6 +249,44 @@ public enum PeerMessage: Equatable, Sendable {
             guard rest.count >= 1 else { throw PeerMessageError.invalidPayload }
             let extID = rest[rest.startIndex]
             return .extended(id: extID, payload: Data(rest.dropFirst()))
+
+        // BEP-52 messages
+        case hashRequestID:
+            guard rest.count >= 48 else { throw PeerMessageError.invalidPayload }
+            let root = Data(rest.prefix(32))
+            let restAfterRoot = rest.dropFirst(32)
+            return .hashRequest(
+                piecesRoot: root,
+                baseLayer: restAfterRoot.readUInt32BE(at: 0),
+                index: restAfterRoot.readUInt32BE(at: 4),
+                length: restAfterRoot.readUInt32BE(at: 8),
+                proofLayers: restAfterRoot.readUInt32BE(at: 12)
+            )
+
+        case hashesID:
+            guard rest.count >= 48 else { throw PeerMessageError.invalidPayload }
+            let root = Data(rest.prefix(32))
+            let restAfterRoot = rest.dropFirst(32)
+            return .hashes(
+                piecesRoot: root,
+                baseLayer: restAfterRoot.readUInt32BE(at: 0),
+                index: restAfterRoot.readUInt32BE(at: 4),
+                length: restAfterRoot.readUInt32BE(at: 8),
+                proofLayers: restAfterRoot.readUInt32BE(at: 12),
+                hashes: Data(restAfterRoot.dropFirst(16))
+            )
+
+        case hashRejectID:
+            guard rest.count >= 48 else { throw PeerMessageError.invalidPayload }
+            let root = Data(rest.prefix(32))
+            let restAfterRoot = rest.dropFirst(32)
+            return .hashReject(
+                piecesRoot: root,
+                baseLayer: restAfterRoot.readUInt32BE(at: 0),
+                index: restAfterRoot.readUInt32BE(at: 4),
+                length: restAfterRoot.readUInt32BE(at: 8),
+                proofLayers: restAfterRoot.readUInt32BE(at: 12)
+            )
 
         default:
             throw PeerMessageError.unknownMessageID(id)

@@ -1,12 +1,12 @@
 import Foundation
 
-/// Represents a parsed .torrent file.
+/// Represents a parsed .torrent file — supports v1, v2, and hybrid formats (BEP-3, BEP-52).
 public struct TorrentInfo: Sendable, Identifiable, Equatable, Hashable {
     public var id: InfoHash { infoHash }
     public let infoHash: InfoHash
     public let name: String
     public let pieceLength: Int
-    public let pieces: Data  // concatenated SHA-1 hashes, 20 bytes each
+    public let pieces: Data  // concatenated SHA-1 hashes, 20 bytes each (v1)
     public let totalSize: Int64
     public let files: [FileEntry]
     public let isPrivate: Bool
@@ -15,8 +15,15 @@ public struct TorrentInfo: Sendable, Identifiable, Equatable, Hashable {
     public let creationDate: Date?
     public let announceURL: String?
     public let announceList: [[String]]
+    public let metaVersion: Int  // 1 = v1 only, 2 = v2 or hybrid
 
-    /// A single file within the torrent.
+    /// BEP-52 file tree entries with their pieces root hashes.
+    public let fileTree: [V2FileEntry]
+
+    /// BEP-52 piece layers: mapping from pieces_root -> concatenated layer hashes.
+    public let pieceLayers: [Data: Data]
+
+    /// A single file within the torrent (v1 format).
     public struct FileEntry: Sendable, Identifiable, Equatable, Hashable {
         public var id: String { path }
         public let path: String
@@ -27,6 +34,21 @@ public struct TorrentInfo: Sendable, Identifiable, Equatable, Hashable {
             self.path = path
             self.length = length
             self.offset = offset
+        }
+    }
+
+    /// A file entry from the v2 "file tree" structure.
+    public struct V2FileEntry: Sendable, Identifiable, Equatable, Hashable {
+        public var id: String { path }
+        public let path: String
+        public let length: Int64
+        /// SHA-256 root hash of the Merkle tree for this file (32 bytes).
+        public let piecesRoot: Data?
+
+        public init(path: String, length: Int64, piecesRoot: Data?) {
+            self.path = path
+            self.length = length
+            self.piecesRoot = piecesRoot
         }
     }
 
@@ -42,7 +64,10 @@ public struct TorrentInfo: Sendable, Identifiable, Equatable, Hashable {
         createdBy: String?,
         creationDate: Date?,
         announceURL: String?,
-        announceList: [[String]]
+        announceList: [[String]],
+        metaVersion: Int = 1,
+        fileTree: [V2FileEntry] = [],
+        pieceLayers: [Data: Data] = [:]
     ) {
         self.infoHash = infoHash
         self.name = name
@@ -56,10 +81,23 @@ public struct TorrentInfo: Sendable, Identifiable, Equatable, Hashable {
         self.creationDate = creationDate
         self.announceURL = announceURL
         self.announceList = announceList
+        self.metaVersion = metaVersion
+        self.fileTree = fileTree
+        self.pieceLayers = pieceLayers
     }
 
     public var pieceCount: Int {
         pieces.count / 20
+    }
+
+    /// True if this is a v2 or hybrid torrent.
+    public var isV2: Bool {
+        metaVersion >= 2
+    }
+
+    /// True if this is a hybrid torrent (has both v1 pieces and v2 file tree).
+    public var isHybrid: Bool {
+        metaVersion >= 2 && !pieces.isEmpty && pieces.count >= 20
     }
 
     /// Parse a .torrent file from raw data.
@@ -77,7 +115,17 @@ public struct TorrentInfo: Sendable, Identifiable, Equatable, Hashable {
 
         // Find the raw bytes of the info dictionary for hashing
         let infoData = try findInfoDictBytes(in: data)
-        let infoHash = InfoHash.v1(from: infoData)
+
+        // Detect meta version
+        let metaVersion = infoValue["meta version"]?.integerValue.map { Int($0) } ?? 1
+
+        // Compute info hash(es) based on version
+        let infoHash: InfoHash
+        if metaVersion >= 2 {
+            infoHash = InfoHash.hybrid(from: infoData)
+        } else {
+            infoHash = InfoHash.v1(from: infoData)
+        }
 
         guard let nameValue = infoValue["name"], let rawName = nameValue.utf8String else {
             throw TorrentInfoError.invalidFormat("Missing 'name'")
@@ -90,18 +138,23 @@ public struct TorrentInfo: Sendable, Identifiable, Equatable, Hashable {
         guard let plValue = infoValue["piece length"], let pieceLength = plValue.integerValue else {
             throw TorrentInfoError.invalidFormat("Missing 'piece length'")
         }
-        guard let piecesValue = infoValue["pieces"], let pieces = piecesValue.stringValue else {
-            throw TorrentInfoError.invalidFormat("Missing 'pieces'")
+
+        // v1 pieces (may be absent in pure v2 torrents)
+        let pieces: Data
+        if let piecesValue = infoValue["pieces"], let piecesData = piecesValue.stringValue {
+            pieces = piecesData
+        } else {
+            pieces = Data()
         }
 
         let isPrivate = (infoValue["private"]?.integerValue == 1) || (infoValue["private"]?.utf8String == "1")
 
-        // Parse files
+        // Parse v1 files
         var files: [FileEntry] = []
         var totalSize: Int64 = 0
 
         if let filesValue = infoValue["files"]?.listValue {
-            // Multi-file torrent
+            // Multi-file torrent (v1)
             for fileValue in filesValue {
                 guard let length = fileValue["length"]?.integerValue,
                       let pathList = fileValue["path"]?.listValue else {
@@ -120,11 +173,35 @@ public struct TorrentInfo: Sendable, Identifiable, Equatable, Hashable {
                 totalSize += length
             }
         } else if let length = infoValue["length"]?.integerValue {
-            // Single-file torrent
+            // Single-file torrent (v1)
             files.append(FileEntry(path: safeName, length: length, offset: 0))
             totalSize = length
-        } else {
-            throw TorrentInfoError.invalidFormat("Missing 'length' or 'files'")
+        }
+
+        // Parse v2 file tree (BEP 52)
+        var fileTree: [V2FileEntry] = []
+        if let fileTreeDict = infoValue["file tree"], case .dictionary = fileTreeDict {
+            fileTree = try parseFileTree(fileTreeDict, basePath: safeName)
+            if files.isEmpty {
+                // Pure v2 torrent — derive v1-style file entries from file tree
+                var offset: Int64 = 0
+                for entry in fileTree {
+                    files.append(FileEntry(path: entry.path, length: entry.length, offset: offset))
+                    offset += entry.length
+                }
+                totalSize = offset
+            }
+        }
+
+        // Parse piece layers (BEP 52)
+        var pieceLayers: [Data: Data] = [:]
+        if let layersDict = root["piece layers"],
+           let layersPairs = layersDict.dictionaryValue {
+            for (keyData, value) in layersPairs {
+                if let valueData = value.stringValue {
+                    pieceLayers[keyData] = valueData
+                }
+            }
         }
 
         let comment = root["comment"]?.utf8String
@@ -147,8 +224,37 @@ public struct TorrentInfo: Sendable, Identifiable, Equatable, Hashable {
             pieces: pieces, totalSize: totalSize, files: files,
             isPrivate: isPrivate, comment: comment, createdBy: createdBy,
             creationDate: creationDate, announceURL: announceURL,
-            announceList: announceList
+            announceList: announceList, metaVersion: metaVersion,
+            fileTree: fileTree, pieceLayers: pieceLayers
         )
+    }
+
+    /// Recursively parse BEP 52 file tree structure.
+    private static func parseFileTree(_ node: BencodeValue, basePath: String) throws -> [V2FileEntry] {
+        guard case .dictionary = node else { return [] }
+
+        var entries: [V2FileEntry] = []
+
+        guard let pairs = node.dictionaryValue else { return [] }
+        for (keyData, value) in pairs {
+            guard let name = String(data: keyData, encoding: .utf8) else { continue }
+            let safeName = sanitizePathComponent(name)
+            guard !safeName.isEmpty else { continue }
+            let fullPath = basePath.isEmpty ? safeName : basePath + "/" + safeName
+
+            // Check if this is a leaf node (file) — has an empty-string key ""
+            if let fileInfo = value[""], case .dictionary = fileInfo {
+                let length = fileInfo["length"]?.integerValue ?? 0
+                let piecesRoot = fileInfo["pieces root"]?.stringValue
+                entries.append(V2FileEntry(path: fullPath, length: length, piecesRoot: piecesRoot))
+            } else if case .dictionary = value {
+                // Subdirectory — recurse
+                let subEntries = try parseFileTree(value, basePath: fullPath)
+                entries.append(contentsOf: subEntries)
+            }
+        }
+
+        return entries
     }
 
     /// Sanitize single path component preventing directory traversal attacks.

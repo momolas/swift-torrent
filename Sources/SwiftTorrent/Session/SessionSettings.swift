@@ -15,6 +15,8 @@ public struct SessionSettings: Sendable {
     public var maxUploadRatio: Double // 0.0 = unlimited, e.g. 1.0 = stop when uploaded == downloaded
     public var uploadMultiplier: Double // 1.0 = normal/honest, 12.0 = Momo L'As booster factor
     public var isTrackerBlocked: (@Sendable (String) -> Bool)?
+    public var encryptionPolicy: EncryptionPolicy
+    public var utpEnabled: Bool
 
     public init(
         listenPort: UInt16 = 6881,
@@ -29,7 +31,9 @@ public struct SessionSettings: Sendable {
         usePartExtension: Bool = true,
         maxUploadRatio: Double = 0.0,
         uploadMultiplier: Double = 1.0,
-        isTrackerBlocked: (@Sendable (String) -> Bool)? = nil
+        isTrackerBlocked: (@Sendable (String) -> Bool)? = nil,
+        encryptionPolicy: EncryptionPolicy = .preferred,
+        utpEnabled: Bool = true
     ) {
         self.listenPort = listenPort
         self.maxConnections = maxConnections
@@ -44,5 +48,7 @@ public struct SessionSettings: Sendable {
         self.maxUploadRatio = maxUploadRatio
         self.uploadMultiplier = uploadMultiplier
         self.isTrackerBlocked = isTrackerBlocked
+        self.encryptionPolicy = encryptionPolicy
+        self.utpEnabled = utpEnabled
     }
 }
