@@ -56,6 +56,60 @@ public struct HTTPTracker: Sendable {
         return try parseAnnounceResponse(data)
     }
 
+    /// Scrape the tracker (BEP-48).
+    public func scrape(infoHash: InfoHash) async throws -> ScrapeInfo {
+        var scrapeURLString = announceURL
+        if scrapeURLString.contains("/announce") {
+            scrapeURLString = scrapeURLString.replacing("/announce", with: "/scrape")
+        } else {
+            throw TrackerError.invalidURL
+        }
+
+        guard var components = URLComponents(string: scrapeURLString) else {
+            throw TrackerError.invalidURL
+        }
+
+        let query = "info_hash=\(infoHash.urlEncoded)"
+        if let existing = components.percentEncodedQuery, !existing.isEmpty {
+            components.percentEncodedQuery = existing + "&" + query
+        } else {
+            components.percentEncodedQuery = query
+        }
+
+        guard let url = components.url else {
+            throw TrackerError.invalidURL
+        }
+
+        let (data, _) = try await URLSession.shared.data(from: url)
+        let decoder = BencodeDecoder()
+        let value = try decoder.decode(data)
+
+        if let failure = value["failure reason"]?.utf8String {
+            throw TrackerError.failure(failure)
+        }
+
+        guard let files = value["files"]?.dictionaryValue else {
+            throw TrackerError.invalidResponse
+        }
+
+        // Try to match the infoHash in the files dictionary
+        for (keyData, fileDict) in files {
+            // Key can be raw 20 bytes or hex string
+            let matches = (keyData == infoHash.bytes)
+                || (String(data: keyData, encoding: .utf8)?.lowercased() == infoHash.hex.lowercased())
+                || files.count == 1
+
+            if matches {
+                let seeders = fileDict["complete"]?.integerValue.map(Int.init) ?? 0
+                let leechers = fileDict["incomplete"]?.integerValue.map(Int.init) ?? 0
+                let completed = fileDict["downloaded"]?.integerValue.map(Int.init) ?? 0
+                return ScrapeInfo(seeders: seeders, leechers: leechers, completed: completed)
+            }
+        }
+
+        throw TrackerError.invalidResponse
+    }
+
     private func parseAnnounceResponse(_ data: Data) throws -> AnnounceResponse {
         let decoder = BencodeDecoder()
         let value = try decoder.decode(data)
@@ -93,6 +147,18 @@ public struct HTTPTracker: Sendable {
         return AnnounceResponse(
             interval: interval, seeders: seeders, leechers: leechers, peers: peers
         )
+    }
+}
+
+public struct ScrapeInfo: Sendable, Equatable {
+    public let seeders: Int
+    public let leechers: Int
+    public let completed: Int
+
+    public init(seeders: Int, leechers: Int, completed: Int) {
+        self.seeders = seeders
+        self.leechers = leechers
+        self.completed = completed
     }
 }
 

@@ -55,7 +55,7 @@ public actor TorrentHandle {
 
         if let magnet = params.magnetLink, !magnet.trackers.isEmpty {
             let tiers = magnet.trackers.map { [$0] }
-            self.trackerManager = TrackerManager(tiers: tiers, group: group)
+            self.trackerManager = TrackerManager(tiers: tiers, group: group, isBlocked: settings.isTrackerBlocked)
         }
     }
 
@@ -70,7 +70,9 @@ public actor TorrentHandle {
         self.diskIO = dio
 
         if self.trackerManager == nil {
-            self.trackerManager = TrackerManager(info: info, group: group)
+            self.trackerManager = TrackerManager(info: info, group: group, isBlocked: settings.isTrackerBlocked)
+        } else if let isBlocked = settings.isTrackerBlocked {
+            await trackerManager?.setIsBlocked(isBlocked)
         }
 
         await peerManager.configure(
@@ -186,9 +188,10 @@ public actor TorrentHandle {
         // Announce to trackers
         if let trackerMgr = trackerManager {
             let left = getRemainingBytes()
+            let reportedUploaded = Int64(Double(totalUploaded) * max(1.0, settings.uploadMultiplier))
             let params = AnnounceParams(
                 infoHash: infoHash, peerID: peerID, port: settings.listenPort,
-                uploaded: totalUploaded, downloaded: totalDownloaded,
+                uploaded: reportedUploaded, downloaded: totalDownloaded,
                 left: left, event: "started"
             )
             await announceToAllTrackers(trackerMgr: trackerMgr, params: params)
@@ -275,9 +278,10 @@ public actor TorrentHandle {
 
         // Announce completed event to trackers
         if let trackerMgr = trackerManager {
+            let reportedUploaded = Int64(Double(totalUploaded) * max(1.0, settings.uploadMultiplier))
             let params = AnnounceParams(
                 infoHash: infoHash, peerID: peerID, port: settings.listenPort,
-                uploaded: totalUploaded, downloaded: totalDownloaded,
+                uploaded: reportedUploaded, downloaded: totalDownloaded,
                 left: 0, event: "completed"
             )
             Task { await announceToAllTrackers(trackerMgr: trackerMgr, params: params) }
@@ -320,9 +324,10 @@ public actor TorrentHandle {
                 let peerID = self.peerID
                 let uploaded = await self.totalUploaded
                 let downloaded = await self.totalDownloaded
+                let reportedUploaded = Int64(Double(uploaded) * max(1.0, self.settings.uploadMultiplier))
                 let params = AnnounceParams(
                     infoHash: infoHash, peerID: peerID, port: self.settings.listenPort,
-                    uploaded: uploaded, downloaded: downloaded,
+                    uploaded: reportedUploaded, downloaded: downloaded,
                     left: left
                 )
                 let allPeers = await trackerMgr.announceAll(params: params)
@@ -416,6 +421,41 @@ public actor TorrentHandle {
     /// Returns connected peers for UI inspection.
     public func getPeers() async -> [PeerInfo] {
         await peerManager.getPeers()
+    }
+
+    /// Returns the list of trackers and their current telemetry.
+    public func getTrackers() async -> [TrackerEntry] {
+        guard let trackerMgr = trackerManager else { return [] }
+        return await trackerMgr.getTrackerEntries()
+    }
+
+    /// Dynamically injects a new tracker URL into the tracker tiers.
+    public func addTracker(urlString: String) async {
+        if let trackerMgr = trackerManager {
+            await trackerMgr.addTracker(urlString: urlString)
+        } else {
+            let tm = TrackerManager(tiers: [[urlString]], group: group, isBlocked: settings.isTrackerBlocked)
+            self.trackerManager = tm
+        }
+    }
+
+    /// Announce immediately to all trackers.
+    public func forceReannounce() async {
+        guard let trackerMgr = trackerManager else { return }
+        let left = getRemainingBytes()
+        let reportedUploaded = Int64(Double(totalUploaded) * max(1.0, settings.uploadMultiplier))
+        let params = AnnounceParams(
+            infoHash: infoHash, peerID: peerID, port: settings.listenPort,
+            uploaded: reportedUploaded, downloaded: totalDownloaded,
+            left: left
+        )
+        await announceToAllTrackers(trackerMgr: trackerMgr, params: params)
+    }
+
+    /// Scrape swarm stats (seeders, leechers, completed) from all trackers.
+    public func scrape() async -> [String: ScrapeInfo] {
+        guard let trackerMgr = trackerManager else { return [:] }
+        return await trackerMgr.scrape(infoHash: infoHash)
     }
 
     /// Returns the completed pieces bitfield for UI piece grid inspection.

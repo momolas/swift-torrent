@@ -125,6 +125,97 @@ public final class UDPTracker: Sendable {
         return AnnounceResponse(interval: interval, seeders: seeders, leechers: leechers, peers: peers)
     }
 
+    /// Scrape the UDP tracker (BEP-15).
+    public func scrape(infoHashes: [InfoHash]) async throws -> [InfoHash: ScrapeInfo] {
+        guard !infoHashes.isEmpty else { return [:] }
+
+        // Resolve host
+        let resolvedHost: String
+        do {
+            _ = try SocketAddress(ipAddress: host, port: port)
+            resolvedHost = host
+        } catch {
+            resolvedHost = try await resolveHostname(host)
+        }
+
+        let handler = UDPResponseHandler()
+        let channel = try await DatagramBootstrap(group: group)
+            .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
+            .channelInitializer { channel in
+                channel.pipeline.addHandler(handler)
+            }
+            .bind(host: "0.0.0.0", port: 0)
+            .get()
+
+        defer {
+            channel.close(promise: nil)
+        }
+
+        let remoteAddr = try SocketAddress(ipAddress: resolvedHost, port: port)
+
+        // Step 1: Connect request
+        let transactionID = UInt32.random(in: 0...UInt32.max)
+        var connectReq = Data()
+        connectReq.append(contentsOf: UInt64(0x41727101980).bigEndianBytes) // magic
+        connectReq.append(contentsOf: UInt32(0).bigEndianBytes) // action: connect
+        connectReq.append(contentsOf: transactionID.bigEndianBytes)
+
+        var buf = channel.allocator.buffer(capacity: connectReq.count)
+        buf.writeBytes(connectReq)
+        let envelope = AddressedEnvelope(remoteAddress: remoteAddr, data: buf)
+        try await channel.writeAndFlush(envelope).get()
+
+        // Read connect response (16 bytes: action(4) + txid(4) + connection_id(8))
+        let connectResponse = try await handler.waitForResponse(timeout: .seconds(5))
+        guard connectResponse.count >= 16 else {
+            throw TrackerError.invalidResponse
+        }
+        let respAction = connectResponse.readUInt32BE(at: 0)
+        let respTxID = connectResponse.readUInt32BE(at: 4)
+        guard respAction == 0, respTxID == transactionID else {
+            throw TrackerError.invalidResponse
+        }
+        let connectionID = connectResponse.readUInt64BE(at: 8)
+
+        // Step 2: Scrape request (BEP 15)
+        let scrapeTxID = UInt32.random(in: 0...UInt32.max)
+        var scrapeReq = Data()
+        scrapeReq.append(contentsOf: connectionID.bigEndianBytes)
+        scrapeReq.append(contentsOf: UInt32(2).bigEndianBytes) // action: scrape (2)
+        scrapeReq.append(contentsOf: scrapeTxID.bigEndianBytes)
+        for hash in infoHashes {
+            scrapeReq.append(hash.bytes)
+        }
+
+        var sbuf = channel.allocator.buffer(capacity: scrapeReq.count)
+        sbuf.writeBytes(scrapeReq)
+        let senvelope = AddressedEnvelope(remoteAddress: remoteAddr, data: sbuf)
+        try await channel.writeAndFlush(senvelope).get()
+
+        // Read scrape response: action(4) + txid(4) + N * (seeders(4) + completed(4) + leechers(4))
+        let scrapeResponse = try await handler.waitForResponse(timeout: .seconds(5))
+        guard scrapeResponse.count >= 8 + infoHashes.count * 12 else {
+            throw TrackerError.invalidResponse
+        }
+        let scrapeAction = scrapeResponse.readUInt32BE(at: 0)
+        let scrapeResTxID = scrapeResponse.readUInt32BE(at: 4)
+        guard scrapeAction == 2, scrapeResTxID == scrapeTxID else {
+            throw TrackerError.invalidResponse
+        }
+
+        var result: [InfoHash: ScrapeInfo] = [:]
+        var offset = 8
+        for hash in infoHashes {
+            let seeders = Int(scrapeResponse.readUInt32BE(at: offset))
+            let completed = Int(scrapeResponse.readUInt32BE(at: offset + 4))
+            let leechers = Int(scrapeResponse.readUInt32BE(at: offset + 8))
+            result[hash] = ScrapeInfo(seeders: seeders, leechers: leechers, completed: completed)
+            offset += 12
+        }
+
+        return result
+    }
+
     private func resolveHostname(_ hostname: String) async throws -> String {
         try await withCheckedThrowingContinuation { continuation in
             Task.detached(priority: .userInitiated) {

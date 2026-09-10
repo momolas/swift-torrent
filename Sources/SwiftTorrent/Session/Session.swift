@@ -128,6 +128,30 @@ public actor Session {
         }
     }
 
+    /// Returns the trackers list for a given torrent infoHash.
+    public func trackers(for infoHash: InfoHash) async -> [TrackerEntry] {
+        guard let handle = torrents[infoHash] else { return [] }
+        return await handle.getTrackers()
+    }
+
+    /// Add a tracker to an active torrent.
+    public func addTracker(urlString: String, to infoHash: InfoHash) async {
+        guard let handle = torrents[infoHash] else { return }
+        await handle.addTracker(urlString: urlString)
+    }
+
+    /// Force reannounce an active torrent to all its trackers.
+    public func forceReannounce(for infoHash: InfoHash) async {
+        guard let handle = torrents[infoHash] else { return }
+        await handle.forceReannounce()
+    }
+
+    /// Scrape swarm stats for an active torrent across its trackers.
+    public func scrape(for infoHash: InfoHash) async -> [String: ScrapeInfo] {
+        guard let handle = torrents[infoHash] else { return [:] }
+        return await handle.scrape()
+    }
+
     /// Shutdown the session.
     public func shutdown() async throws {
         await pauseAll()
