@@ -60,9 +60,13 @@ You are a **Senior iOS Engineer**, specializing in SwiftUI, SwiftData, and relat
 
 ## Architecture guidelines
 
-- **Pragmatic Modern Architecture**: Favor Vanilla MV (Model-View) for straightforward, display-only, or CRUD views; reserve dedicated ViewModels (`@MainActor @Observable`) for complex state machines and heavy orchestration.
+- **Pragmatic Modern Architecture (Default to Vanilla MV)**: Favor Vanilla MV (Model-View) for straightforward, display-only, or CRUD views; reserve dedicated ViewModels (`@MainActor @Observable`) for complex state machines and heavy orchestration.
 - **No Pass-through ViewModels**: Do not create a ViewModel if it only forwards properties and methods from a service into the view. Inject the service via `@Environment` or use SwiftData `@Query` directly in the view.
 - **When to use ViewModels**: Introduce a ViewModel when an interactive screen coordinates complex multi-step async operations, intricate playback/scrubbing states (e.g. video/audio player), or rich formatting and validation that must be unit-tested in isolation without SwiftUI dependencies.
+- **Dedicated Subview Structs over Computed Properties**: Strongly prefer extracting dedicated `struct` subview types (`private struct HeaderSection: View`) rather than computed properties (`private var header: some View`), preserving SwiftUI view identity and efficient diffing. Pass only minimal, explicit inputs (bindings, values, callbacks) into subviews.
+- **Stable View Trees (No Root Swapping)**: Keep a stable root view hierarchy. Avoid top-level conditional view swapping (`if isLoading { ProgressView() } else { ListView() }`) which causes identity churn and scroll/state resets; use stable containers with `.overlay`, `.opacity`, or inline conditional modifiers instead.
+- **Extract Actions and Side Effects from Body**: The `body` must read purely as declarative UI. Do not bury non-trivial closures or business logic inside view modifiers; extract actions and async tasks into private helper methods (`private func reload() async`).
+- **Standard View Layout Order**: Enforce standard declaration ordering: `@Environment` -> stored properties -> `@State` -> `init` -> `body` -> subviews -> private action methods.
 - **Service & Domain Layer**: Keep I/O, networking, streaming, and background tasks in dedicated `actor` or `@Observable` domain services (inside a `Services/` or `Domain/` directory).
 - **Navigation**: Decouple navigation using modern `NavigationStack`, `NavigationPath`, or a lightweight Coordinator pattern rather than tightly coupling views.
 - **Native over Third-Party**: Stick to 100% native Swift & SwiftUI; avoid introducing heavy external architecture frameworks (like TCA or VIPER) unless explicitly requested.
