@@ -1,6 +1,4 @@
 import Foundation
-import NIOCore
-import NIOPosix
 
 /// Errors thrown by TorrentHandle wait methods.
 public enum TorrentError: Error {
@@ -14,7 +12,6 @@ public actor TorrentHandle {
     private let magnetLink: MagnetLink?
     private let savePath: String
     private let peerID: Data
-    private let group: EventLoopGroup
 
     private var peerManager: PeerManager
     private var pieceManager: PieceManager?
@@ -39,14 +36,13 @@ public actor TorrentHandle {
     private let dhtNode: DHTNode?
     private var dhtAnnounceTask: Task<Void, Never>?
 
-    public init(params: AddTorrentParams, settings: SessionSettings, group: EventLoopGroup, dhtNode: DHTNode? = nil) {
+    public init(params: AddTorrentParams, settings: SessionSettings, group: Any? = nil, dhtNode: DHTNode? = nil) {
         let hash = params.infoHash!
         self.infoHash = hash
         self.info = params.torrentInfo
         self.magnetLink = params.magnetLink
         self.savePath = params.savePath ?? settings.savePath
         self.peerID = generatePeerID()
-        self.group = group
         self.settings = settings
         self.resumeData = params.resumeData
         self.isStreaming = params.isStreaming
@@ -57,7 +53,6 @@ public actor TorrentHandle {
         self.peerManager = PeerManager(
             infoHash: hash.bytes,
             peerID: peerID,
-            group: group,
             maxConnections: settings.maxConnectionsPerTorrent,
             isPrivate: isPriv,
             dhtPort: dhtP
@@ -65,7 +60,7 @@ public actor TorrentHandle {
 
         if let magnet = params.magnetLink, !magnet.trackers.isEmpty {
             let tiers = magnet.trackers.map { [$0] }
-            self.trackerManager = TrackerManager(tiers: tiers, group: group, isBlocked: settings.isTrackerBlocked)
+            self.trackerManager = TrackerManager(tiers: tiers, isBlocked: settings.isTrackerBlocked)
         }
     }
 
@@ -80,7 +75,7 @@ public actor TorrentHandle {
         self.diskIO = dio
 
         if self.trackerManager == nil {
-            self.trackerManager = TrackerManager(info: info, group: group, isBlocked: settings.isTrackerBlocked)
+            self.trackerManager = TrackerManager(info: info, isBlocked: settings.isTrackerBlocked)
         } else if let isBlocked = settings.isTrackerBlocked {
             await trackerManager?.setIsBlocked(isBlocked)
         }
@@ -485,7 +480,7 @@ public actor TorrentHandle {
         if let trackerMgr = trackerManager {
             await trackerMgr.addTracker(urlString: urlString)
         } else {
-            let tm = TrackerManager(tiers: [[urlString]], group: group, isBlocked: settings.isTrackerBlocked)
+            let tm = TrackerManager(tiers: [[urlString]], isBlocked: settings.isTrackerBlocked)
             self.trackerManager = tm
         }
     }

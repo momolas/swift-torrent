@@ -1,12 +1,9 @@
 import Foundation
-import NIOCore
-import NIOPosix
 
 /// Manages the pool of peer connections for a torrent.
 public actor PeerManager {
     private let infoHash: Data
     private let peerID: Data
-    private let group: EventLoopGroup
     private var connections: [String: PeerConnection] = [:]
     private var connectedPeers: Set<String> = []
     private var peerInfos: [String: PeerInfo] = [:]
@@ -39,14 +36,13 @@ public actor PeerManager {
     public init(
         infoHash: Data,
         peerID: Data,
-        group: EventLoopGroup,
+        group: Any? = nil,
         maxConnections: Int = 50,
         isPrivate: Bool = false,
         dhtPort: UInt16? = nil
     ) {
         self.infoHash = infoHash
         self.peerID = peerID
-        self.group = group
         self.maxConnections = maxConnections
         self.isPrivate = isPrivate
         self.dhtPort = dhtPort
@@ -142,7 +138,7 @@ public actor PeerManager {
 
         Task {
             do {
-                let _ = try await conn.connect(on: group)
+                try await conn.connect()
                 await self.onPeerConnected(key: key, conn: conn)
             } catch {
                 self.removePeerByKey(key)

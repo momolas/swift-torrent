@@ -1,6 +1,9 @@
 import Foundation
-import NIOCore
-import NIOPosix
+#if canImport(Darwin)
+import Darwin
+#else
+import Glibc
+#endif
 
 /// Well-known DHT bootstrap nodes.
 private let bootstrapNodes: [(String, Int)] = [
@@ -15,58 +18,102 @@ public actor DHTNode {
     public let nodeID: NodeID
     private var routingTable: DHTRoutingTable
     private var storage: DHTStorage
-    private let group: EventLoopGroup
-    private var channel: Channel?
+    private var socketFD: Int32 = -1
+    private var readSource: DispatchSourceRead?
     private let port: Int
-    private var responseHandler: DHTResponseHandler?
+    private let queue = DispatchQueue(label: "org.swifttorrent.dhtnode", qos: .utility)
     private var pendingQueries: [Data: CheckedContinuation<DHTMessage, Error>] = [:]
 
-    public init(nodeID: NodeID = .random(), port: Int = 6881, group: EventLoopGroup) {
+    public init(nodeID: NodeID = .random(), port: Int = 6881, group: Any? = nil) {
         self.nodeID = nodeID
         self.routingTable = DHTRoutingTable(ownID: nodeID)
         self.storage = DHTStorage()
-        self.group = group
         self.port = port
     }
 
     /// Start the DHT node, binding to a UDP port and bootstrapping.
     public func start() async throws {
-        let handler = DHTResponseHandler()
-        self.responseHandler = handler
-
-        var boundChannel: Channel?
-        var lastError: Error?
+        var boundFD: Int32 = -1
         let portsToTry = [port, port + 1, port + 2, port + 3, 0]
+
         for p in portsToTry {
-            do {
-                let chan = try await DatagramBootstrap(group: group)
-                    .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
-                    .channelInitializer { channel in
-                        channel.pipeline.addHandler(handler)
-                    }
-                    .bind(host: "0.0.0.0", port: p)
-                    .get()
-                boundChannel = chan
+            let fd = socket(AF_INET, SOCK_DGRAM, 0)
+            guard fd >= 0 else { continue }
+
+            var reuse: Int32 = 1
+            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
+
+            var addr = sockaddr_in()
+            addr.sin_family = sa_family_t(AF_INET)
+            addr.sin_port = in_port_t(UInt16(p).bigEndian)
+            addr.sin_addr.s_addr = INADDR_ANY
+
+            let bindResult = withUnsafePointer(to: &addr) { ptr in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                    bind(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+
+            if bindResult == 0 {
+                // Set non-blocking
+                let flags = fcntl(fd, F_GETFL, 0)
+                _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+                boundFD = fd
                 break
-            } catch {
-                lastError = error
+            } else {
+                close(fd)
             }
         }
 
-        guard let ch = boundChannel else {
-            throw lastError ?? NIOCore.IOError(errnoCode: 1, reason: "Unable to bind DHT port")
+        guard boundFD >= 0 else {
+            throw DHTMessageError.invalidMessage
         }
-        self.channel = ch
 
-        handler.onMessage = { [weak self] message, address, port in
+        self.socketFD = boundFD
+
+        let source = DispatchSource.makeReadSource(fileDescriptor: boundFD, queue: queue)
+        source.setEventHandler { [weak self] in
             guard let self else { return }
-            Task {
-                await self.handleIncomingMessage(message, from: address, port: port)
+            var buffer = [UInt8](repeating: 0, count: 65535)
+            var senderAddr = sockaddr_in()
+            var senderLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+
+            let bytesRead = withUnsafeMutablePointer(to: &senderAddr) { ptr in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                    recvfrom(boundFD, &buffer, buffer.count, 0, sa, &senderLen)
+                }
+            }
+
+            guard bytesRead > 0 else { return }
+
+            let data = Data(buffer[0..<bytesRead])
+            var ipStr = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+            inet_ntop(AF_INET, &senderAddr.sin_addr, &ipStr, socklen_t(INET_ADDRSTRLEN))
+            let address = String(cString: ipStr)
+            let port = UInt16(bigEndian: senderAddr.sin_port)
+
+            if let message = try? DHTMessage.decode(from: data) {
+                Task {
+                    await self.handleIncomingMessage(message, from: address, port: port)
+                }
             }
         }
+
+        source.setCancelHandler {
+            close(boundFD)
+        }
+
+        source.resume()
+        self.readSource = source
 
         // Bootstrap: contact well-known nodes
         await bootstrap()
+    }
+
+    public func stop() {
+        readSource?.cancel()
+        readSource = nil
+        socketFD = -1
     }
 
     /// Bootstrap by contacting well-known DHT nodes.
@@ -299,13 +346,21 @@ public actor DHTNode {
     }
 
     private func sendMessage(_ msg: DHTMessage, to address: String, port: UInt16) async throws {
-        guard let ch = channel else { return }
+        guard socketFD >= 0 else { return }
         let data = msg.encode()
-        let remoteAddr = try SocketAddress(ipAddress: address, port: Int(port))
-        var buf = ch.allocator.buffer(capacity: data.count)
-        buf.writeBytes(data)
-        let envelope = AddressedEnvelope(remoteAddress: remoteAddr, data: buf)
-        try await ch.writeAndFlush(envelope).get()
+
+        var destAddr = sockaddr_in()
+        destAddr.sin_family = sa_family_t(AF_INET)
+        destAddr.sin_port = port.bigEndian
+        guard inet_pton(AF_INET, address, &destAddr.sin_addr) == 1 else { return }
+
+        _ = data.withUnsafeBytes { rawBuffer in
+            withUnsafePointer(to: &destAddr) { ptr in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                    sendto(socketFD, rawBuffer.baseAddress, data.count, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+        }
     }
 
     /// Parse compact node info (26 bytes each: 20 ID + 4 IP + 2 port).
@@ -360,35 +415,5 @@ public actor DHTNode {
                 continuation.resume(returning: host)
             }
         }
-    }
-}
-
-/// NIO channel handler for incoming DHT messages.
-private final class DHTResponseHandler: ChannelInboundHandler, @unchecked Sendable {
-    typealias InboundIn = AddressedEnvelope<ByteBuffer>
-
-    var onMessage: ((DHTMessage, String, UInt16) -> Void)?
-
-    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
-        let envelope = unwrapInboundIn(data)
-        var buffer = envelope.data
-        guard let bytes = buffer.readBytes(length: buffer.readableBytes) else { return }
-
-        // Extract sender address
-        let address: String
-        let port: UInt16
-        switch envelope.remoteAddress {
-        case .v4(let addr):
-            address = addr.host
-            port = UInt16(envelope.remoteAddress.port ?? 0)
-        case .v6(let addr):
-            address = addr.host
-            port = UInt16(envelope.remoteAddress.port ?? 0)
-        default:
-            return
-        }
-
-        guard let message = try? DHTMessage.decode(from: Data(bytes)) else { return }
-        onMessage?(message, address, port)
     }
 }

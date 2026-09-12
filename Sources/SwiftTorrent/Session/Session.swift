@@ -1,19 +1,15 @@
 import Foundation
-import NIOCore
-import NIOPosix
 
 /// Top-level controller for managing torrents.
 public actor Session {
     private var settings: SessionSettings
     private var torrents: [InfoHash: TorrentHandle] = [:]
-    private let group: MultiThreadedEventLoopGroup
     private var dhtNode: DHTNode?
     private let alertContinuation: AsyncStream<any Alert>.Continuation
     public let alerts: AsyncStream<any Alert>
 
     public init(settings: SessionSettings = SessionSettings()) {
         self.settings = settings
-        self.group = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
 
         let (stream, continuation) = AsyncStream<any Alert>.makeStream()
         self.alerts = stream
@@ -33,7 +29,7 @@ public actor Session {
             try? await startDHT()
         }
 
-        let handle = TorrentHandle(params: params, settings: settings, group: group, dhtNode: dhtNode)
+        let handle = TorrentHandle(params: params, settings: settings, dhtNode: dhtNode)
         await handle.finishInitialization()
         torrents[hash] = handle
 
@@ -96,7 +92,7 @@ public actor Session {
     /// Start DHT if enabled.
     public func startDHT() async throws {
         guard settings.dhtEnabled else { return }
-        let node = DHTNode(port: settings.dhtPort, group: group)
+        let node = DHTNode(port: settings.dhtPort)
         try await node.start()
         self.dhtNode = node
     }
@@ -160,6 +156,5 @@ public actor Session {
     public func shutdown() async throws {
         await pauseAll()
         alertContinuation.finish()
-        try await group.shutdownGracefully()
     }
 }

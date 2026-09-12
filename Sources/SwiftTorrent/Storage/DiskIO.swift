@@ -1,35 +1,37 @@
 import Foundation
-import NIOCore
-import NIOPosix
 
 public enum DiskIOError: Error {
     case pathTraversalDetected(String)
 }
 
-/// Async disk I/O using NIO thread pool to avoid blocking Swift cooperative threads.
+/// Async disk I/O using a dedicated background dispatch queue to avoid blocking Swift cooperative threads.
 public actor DiskIO {
     private let basePath: String
     private let fileStorage: FileStorage
-    private let threadPool: NIOThreadPool
+    private let ioQueue: DispatchQueue
     public let usePartExtension: Bool
 
     public init(basePath: String, fileStorage: FileStorage, threadPoolSize: Int = 4, usePartExtension: Bool = true) {
         self.basePath = basePath
         self.fileStorage = fileStorage
-        self.threadPool = NIOThreadPool(numberOfThreads: threadPoolSize)
+        self.ioQueue = DispatchQueue(label: "org.swifttorrent.diskio", qos: .utility, attributes: .concurrent)
         self.usePartExtension = usePartExtension
-        self.threadPool.start()
     }
 
-    deinit {
-        try? threadPool.syncShutdownGracefully()
-    }
-
-    /// Explicitly shutdown thread pool.
+    /// Explicitly shutdown I/O queue (no-op retained for backwards compatibility).
     public func shutdown() async {
-        await withCheckedContinuation { continuation in
-            threadPool.shutdownGracefully { _ in
-                continuation.resume()
+        // No explicit shutdown required for GCD DispatchQueue
+    }
+
+    private func runIO<T: Sendable>(_ block: @escaping @Sendable () throws -> T) async throws -> T {
+        try await withCheckedThrowingContinuation { continuation in
+            ioQueue.async {
+                do {
+                    let result = try block()
+                    continuation.resume(returning: result)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
             }
         }
     }
@@ -78,7 +80,7 @@ public actor DiskIO {
         let resolvedSlices = resolvedSlicesList
 
         let usePart = self.usePartExtension
-        try await threadPool.runIfActive {
+        try await runIO {
             var dataOffset = 0
             for slice in resolvedSlices {
                 let finalPath = slice.path
@@ -111,7 +113,7 @@ public actor DiskIO {
         let resolvedSlices = resolvedSlicesList
 
         let usePart = self.usePartExtension
-        return try await threadPool.runIfActive {
+        return try await runIO {
             var result = Data()
             for slice in resolvedSlices {
                 let filePath = Self.effectiveReadPath(for: slice.path, usePartExtension: usePart)
@@ -148,7 +150,7 @@ public actor DiskIO {
         let resolvedFiles = resolvedFilesList
 
         let usePart = self.usePartExtension
-        try await threadPool.runIfActive {
+        try await runIO {
             for file in resolvedFiles {
                 let finalPath = file.path
                 let dir = (finalPath as NSString).deletingLastPathComponent
@@ -177,7 +179,7 @@ public actor DiskIO {
         }
         let resolvedFiles = resolvedFilesList
 
-        try await threadPool.runIfActive {
+        try await runIO {
             for finalPath in resolvedFiles {
                 let partPath = finalPath + ".part"
                 if FileManager.default.fileExists(atPath: partPath) {
@@ -200,7 +202,7 @@ public actor DiskIO {
         }
         let resolvedPaths = paths
         let usePart = self.usePartExtension
-        return (try? await threadPool.runIfActive {
+        return (try? await runIO {
             for path in resolvedPaths {
                 if FileManager.default.fileExists(atPath: path) {
                     return true

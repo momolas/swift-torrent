@@ -1,10 +1,8 @@
 import Foundation
-import NIOCore
 
 /// Coordinates multiple trackers with tier support.
 public actor TrackerManager {
     private var tiers: [[String]]
-    private let group: EventLoopGroup
     private var lastResponse: AnnounceResponse?
     private var announceInterval: Int = 1800
     private var trackerEntries: [String: TrackerEntry] = [:]
@@ -14,9 +12,8 @@ public actor TrackerManager {
         }
     }
 
-    public init(tiers: [[String]], group: EventLoopGroup, isBlocked: (@Sendable (String) -> Bool)? = nil) {
+    public init(tiers: [[String]], group: Any? = nil, isBlocked: (@Sendable (String) -> Bool)? = nil) {
         self.tiers = tiers
-        self.group = group
         self.isBlocked = isBlocked
         for tier in tiers {
             for url in tier {
@@ -27,13 +24,12 @@ public actor TrackerManager {
     }
 
     /// Convenience: create from TorrentInfo.
-    public init(info: TorrentInfo, group: EventLoopGroup, isBlocked: (@Sendable (String) -> Bool)? = nil) {
+    public init(info: TorrentInfo, group: Any? = nil, isBlocked: (@Sendable (String) -> Bool)? = nil) {
         var tiers = info.announceList
         if tiers.isEmpty, let url = info.announceURL {
             tiers = [[url]]
         }
         self.tiers = tiers
-        self.group = group
         self.isBlocked = isBlocked
         for tier in tiers {
             for url in tier {
@@ -103,7 +99,7 @@ public actor TrackerManager {
                             trackerEntries[urlString]?.lastError = "Invalid UDP URL format"
                             continue
                         }
-                        let tracker = UDPTracker(host: host, port: port, group: group)
+                        let tracker = UDPTracker(host: host, port: port)
                         response = try await tracker.announce(params: params)
                     } else {
                         trackerEntries[urlString]?.status = .error
@@ -137,7 +133,6 @@ public actor TrackerManager {
         var allPeers: [(String, UInt16)] = []
         var seenKeys: Set<String> = []
 
-        let capturedGroup = self.group
         let capturedIsBlocked = self.isBlocked
 
         typealias AnnounceResult = (urlString: String, peers: [(String, UInt16)], interval: Int, seeders: Int, leechers: Int, error: Error?)
@@ -160,7 +155,7 @@ public actor TrackerManager {
                                       let port = components.port else {
                                     return (urlString, [], 0, 0, 0, TrackerError.invalidURL)
                                 }
-                                let tracker = UDPTracker(host: host, port: port, group: capturedGroup)
+                                let tracker = UDPTracker(host: host, port: port)
                                 response = try await tracker.announce(params: params)
                             } else {
                                 return (urlString, [], 0, 0, 0, TrackerError.invalidURL)
@@ -212,7 +207,6 @@ public actor TrackerManager {
     /// Scrape across trackers for this torrent's infoHash (BEP 48 / BEP 15).
     public func scrape(infoHash: InfoHash) async -> [String: ScrapeInfo] {
         var results: [String: ScrapeInfo] = [:]
-        let capturedGroup = self.group
 
         await withTaskGroup(of: (String, ScrapeInfo?).self) { group in
             for tier in self.tiers {
@@ -228,7 +222,7 @@ public actor TrackerManager {
                             guard let components = URLComponents(string: urlString),
                                   let host = components.host,
                                   let port = components.port else { return (urlString, nil) }
-                            let tracker = UDPTracker(host: host, port: port, group: capturedGroup)
+                            let tracker = UDPTracker(host: host, port: port)
                             if let dict = try? await tracker.scrape(infoHashes: [infoHash]),
                                let info = dict[infoHash] {
                                 return (urlString, info)

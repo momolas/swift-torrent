@@ -1,26 +1,23 @@
 import Foundation
-import NIOCore
-import NIOPosix
+import Network
 
 /// Manages uTP connections multiplexed over a single UDP socket (BEP 29).
 public actor UTPSocketManager {
     /// Active uTP connections keyed by (remoteAddress, connectionID).
     private var connections: [String: UTPConnection] = [:]
-    private let group: EventLoopGroup
-    private var channel: Channel?
+    private var listener: NWListener?
     private let port: UInt16
 
-    public init(port: UInt16, group: EventLoopGroup) {
+    public init(port: UInt16, group: Any? = nil) {
         self.port = port
-        self.group = group
     }
 
     /// Start listening for incoming uTP packets on the UDP port.
     public func start() async throws {
-        let bootstrap = DatagramBootstrap(group: group)
-            .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
-        let ch = try await bootstrap.bind(host: "0.0.0.0", port: Int(port)).get()
-        self.channel = ch
+        guard let nwPort = NWEndpoint.Port(rawValue: port) else { return }
+        let l = try NWListener(using: .udp, on: nwPort)
+        l.start(queue: .global())
+        self.listener = l
     }
 
     /// Initiate an outgoing uTP connection to a remote peer.

@@ -1,44 +1,20 @@
 import Foundation
-import NIOCore
-import NIOPosix
+import Network
 
-/// UDP tracker client (BEP-15).
+/// UDP tracker client (BEP-15) using native Network.framework.
 public final class UDPTracker: Sendable {
     public let host: String
     public let port: Int
-    private let group: EventLoopGroup
 
-    public init(host: String, port: Int, group: EventLoopGroup) {
+    public init(host: String, port: Int, group: Any? = nil) {
         self.host = host
         self.port = port
-        self.group = group
     }
 
     /// Announce to the UDP tracker.
     public func announce(params: AnnounceParams) async throws -> AnnounceResponse {
-        // Resolve host
-        let resolvedHost: String
-        do {
-            _ = try SocketAddress(ipAddress: host, port: port)
-            resolvedHost = host
-        } catch {
-            resolvedHost = try await resolveHostname(host)
-        }
-
-        let handler = UDPResponseHandler()
-        let channel = try await DatagramBootstrap(group: group)
-            .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
-            .channelInitializer { channel in
-                channel.pipeline.addHandler(handler)
-            }
-            .bind(host: "0.0.0.0", port: 0)
-            .get()
-
-        defer {
-            channel.close(promise: nil)
-        }
-
-        let remoteAddr = try SocketAddress(ipAddress: resolvedHost, port: port)
+        let connection = try await createReadyConnection(host: host, port: port)
+        defer { connection.cancel() }
 
         // Step 1: Connect request
         let transactionID = UInt32.random(in: 0...UInt32.max)
@@ -47,13 +23,7 @@ public final class UDPTracker: Sendable {
         connectReq.append(contentsOf: UInt32(0).bigEndianBytes) // action: connect
         connectReq.append(contentsOf: transactionID.bigEndianBytes)
 
-        var buf = channel.allocator.buffer(capacity: connectReq.count)
-        buf.writeBytes(connectReq)
-        let envelope = AddressedEnvelope(remoteAddress: remoteAddr, data: buf)
-        try await channel.writeAndFlush(envelope).get()
-
-        // Read connect response (16 bytes: action(4) + txid(4) + connection_id(8))
-        let connectResponse = try await handler.waitForResponse(timeout: .seconds(5))
+        let connectResponse = try await sendAndReceive(connection: connection, request: connectReq)
         guard connectResponse.count >= 16 else {
             throw TrackerError.invalidResponse
         }
@@ -76,7 +46,7 @@ public final class UDPTracker: Sendable {
         announceReq.append(contentsOf: params.left.bigEndianBytes)
         announceReq.append(contentsOf: params.uploaded.bigEndianBytes)
 
-        // Map event correctly: 0=none, 1=completed, 2=started, 3=stopped
+        // Map event: 0=none, 1=completed, 2=started, 3=stopped
         let eventCode: UInt32
         switch params.event?.lowercased() {
         case "completed": eventCode = 1
@@ -85,19 +55,12 @@ public final class UDPTracker: Sendable {
         default: eventCode = 0
         }
         announceReq.append(contentsOf: eventCode.bigEndianBytes)
-
         announceReq.append(contentsOf: UInt32(0).bigEndianBytes) // IP
         announceReq.append(contentsOf: UInt32.random(in: 0...UInt32.max).bigEndianBytes) // key
         announceReq.append(contentsOf: Int32(params.numWant).bigEndianBytes)
         announceReq.append(contentsOf: params.port.bigEndianBytes)
 
-        var abuf = channel.allocator.buffer(capacity: announceReq.count)
-        abuf.writeBytes(announceReq)
-        let aenvelope = AddressedEnvelope(remoteAddress: remoteAddr, data: abuf)
-        try await channel.writeAndFlush(aenvelope).get()
-
-        // Read announce response (20+ bytes: action(4) + txid(4) + interval(4) + leechers(4) + seeders(4) + peers(6*N))
-        let announceResponse = try await handler.waitForResponse(timeout: .seconds(5))
+        let announceResponse = try await sendAndReceive(connection: connection, request: announceReq)
         guard announceResponse.count >= 20 else {
             throw TrackerError.invalidResponse
         }
@@ -129,29 +92,8 @@ public final class UDPTracker: Sendable {
     public func scrape(infoHashes: [InfoHash]) async throws -> [InfoHash: ScrapeInfo] {
         guard !infoHashes.isEmpty else { return [:] }
 
-        // Resolve host
-        let resolvedHost: String
-        do {
-            _ = try SocketAddress(ipAddress: host, port: port)
-            resolvedHost = host
-        } catch {
-            resolvedHost = try await resolveHostname(host)
-        }
-
-        let handler = UDPResponseHandler()
-        let channel = try await DatagramBootstrap(group: group)
-            .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
-            .channelInitializer { channel in
-                channel.pipeline.addHandler(handler)
-            }
-            .bind(host: "0.0.0.0", port: 0)
-            .get()
-
-        defer {
-            channel.close(promise: nil)
-        }
-
-        let remoteAddr = try SocketAddress(ipAddress: resolvedHost, port: port)
+        let connection = try await createReadyConnection(host: host, port: port)
+        defer { connection.cancel() }
 
         // Step 1: Connect request
         let transactionID = UInt32.random(in: 0...UInt32.max)
@@ -160,13 +102,7 @@ public final class UDPTracker: Sendable {
         connectReq.append(contentsOf: UInt32(0).bigEndianBytes) // action: connect
         connectReq.append(contentsOf: transactionID.bigEndianBytes)
 
-        var buf = channel.allocator.buffer(capacity: connectReq.count)
-        buf.writeBytes(connectReq)
-        let envelope = AddressedEnvelope(remoteAddress: remoteAddr, data: buf)
-        try await channel.writeAndFlush(envelope).get()
-
-        // Read connect response (16 bytes: action(4) + txid(4) + connection_id(8))
-        let connectResponse = try await handler.waitForResponse(timeout: .seconds(5))
+        let connectResponse = try await sendAndReceive(connection: connection, request: connectReq)
         guard connectResponse.count >= 16 else {
             throw TrackerError.invalidResponse
         }
@@ -187,13 +123,7 @@ public final class UDPTracker: Sendable {
             scrapeReq.append(hash.bytes)
         }
 
-        var sbuf = channel.allocator.buffer(capacity: scrapeReq.count)
-        sbuf.writeBytes(scrapeReq)
-        let senvelope = AddressedEnvelope(remoteAddress: remoteAddr, data: sbuf)
-        try await channel.writeAndFlush(senvelope).get()
-
-        // Read scrape response: action(4) + txid(4) + N * (seeders(4) + completed(4) + leechers(4))
-        let scrapeResponse = try await handler.waitForResponse(timeout: .seconds(5))
+        let scrapeResponse = try await sendAndReceive(connection: connection, request: scrapeReq)
         guard scrapeResponse.count >= 8 + infoHashes.count * 12 else {
             throw TrackerError.invalidResponse
         }
@@ -216,95 +146,90 @@ public final class UDPTracker: Sendable {
         return result
     }
 
-    private func resolveHostname(_ hostname: String) async throws -> String {
-        try await withCheckedThrowingContinuation { continuation in
-            Task.detached(priority: .userInitiated) {
-                var hints = addrinfo()
-                hints.ai_family = AF_INET
-                hints.ai_socktype = Int32(SOCK_DGRAM)
-                var result: UnsafeMutablePointer<addrinfo>?
-                let status = getaddrinfo(hostname, nil, &hints, &result)
-                guard status == 0, let addrInfo = result else {
-                    continuation.resume(throwing: TrackerError.connectionFailed)
-                    return
-                }
-                defer { freeaddrinfo(result) }
-                guard let addr = addrInfo.pointee.ai_addr else {
-                    continuation.resume(throwing: TrackerError.connectionFailed)
-                    return
-                }
-                var hostBuf = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-                getnameinfo(addr, addrInfo.pointee.ai_addrlen, &hostBuf, socklen_t(NI_MAXHOST), nil, 0, NI_NUMERICHOST)
-                let ipString = hostBuf.withUnsafeBufferPointer { ptr in
-                    String(cString: ptr.baseAddress!)
-                }
-                continuation.resume(returning: ipString)
-            }
+    private func createReadyConnection(host: String, port: Int, timeoutSeconds: Double = 5.0) async throws -> NWConnection {
+        let nwHost = NWEndpoint.Host(host)
+        guard let nwPort = NWEndpoint.Port(rawValue: UInt16(port)) else {
+            throw TrackerError.invalidURL
         }
-    }
-}
-
-/// NIO channel handler that collects UDP responses.
-private final class UDPResponseHandler: ChannelInboundHandler, @unchecked Sendable {
-    typealias InboundIn = AddressedEnvelope<ByteBuffer>
-
-    private let lock = NSLock()
-    private var continuations: [Int: CheckedContinuation<Data, any Error>] = [:]
-    private var nextID = 0
-    private var receivedData: [Data] = []
-
-    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
-        let envelope = unwrapInboundIn(data)
-        var buffer = envelope.data
-        guard let bytes = buffer.readBytes(length: buffer.readableBytes) else { return }
-        let responseData = Data(bytes)
-
-        let contToResume: CheckedContinuation<Data, any Error>? = lock.withLock {
-            if let firstKey = continuations.keys.sorted().first {
-                return continuations.removeValue(forKey: firstKey)
-            } else {
-                receivedData.append(responseData)
-                return nil
-            }
-        }
-        contToResume?.resume(returning: responseData)
-    }
-
-    func waitForResponse(timeout: TimeAmount = .seconds(5)) async throws -> Data {
-        let existingData: Data? = lock.withLock {
-            if !receivedData.isEmpty {
-                return receivedData.removeFirst()
-            }
-            return nil
-        }
-
-        if let data = existingData {
-            return data
-        }
+        let connection = NWConnection(host: nwHost, port: nwPort, using: .udp)
+        let queue = DispatchQueue(label: "org.swifttorrent.udptracker.conn")
 
         return try await withCheckedThrowingContinuation { continuation in
-            let idToTimeout: Int? = lock.withLock {
-                if !receivedData.isEmpty {
-                    continuation.resume(returning: receivedData.removeFirst())
-                    return nil
-                } else {
-                    let id = nextID
-                    nextID += 1
-                    continuations[id] = continuation
-                    return id
+            let resumed = AtomicFlag(false)
+
+            let timer = DispatchSource.makeTimerSource(queue: queue)
+            timer.schedule(deadline: .now() + timeoutSeconds)
+            timer.setEventHandler {
+                if resumed.testAndSet() {
+                    timer.cancel()
+                    connection.cancel()
+                    continuation.resume(throwing: TrackerError.connectionFailed)
                 }
             }
+            timer.resume()
 
-            guard let id = idToTimeout else { return }
-
-            let seconds = Double(timeout.nanoseconds) / 1_000_000_000.0
-            Task {
-                try? await Task.sleep(for: .seconds(max(seconds, 1)))
-                let contToResume = self.lock.withLock { () -> (CheckedContinuation<Data, any Error>)? in
-                    self.continuations.removeValue(forKey: id)
+            connection.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    if resumed.testAndSet() {
+                        timer.cancel()
+                        connection.stateUpdateHandler = nil
+                        continuation.resume(returning: connection)
+                    }
+                case .failed(let error):
+                    if resumed.testAndSet() {
+                        timer.cancel()
+                        connection.cancel()
+                        continuation.resume(throwing: error)
+                    }
+                case .cancelled:
+                    if resumed.testAndSet() {
+                        timer.cancel()
+                        continuation.resume(throwing: TrackerError.connectionFailed)
+                    }
+                default:
+                    break
                 }
-                contToResume?.resume(throwing: TrackerError.connectionFailed)
             }
+            connection.start(queue: queue)
+        }
+    }
+
+    private func sendAndReceive(connection: NWConnection, request: Data, timeoutSeconds: Double = 5.0) async throws -> Data {
+        try await withCheckedThrowingContinuation { continuation in
+            let resumed = AtomicFlag(false)
+
+            let timer = DispatchSource.makeTimerSource(queue: .global())
+            timer.schedule(deadline: .now() + timeoutSeconds)
+            timer.setEventHandler {
+                if resumed.testAndSet() {
+                    timer.cancel()
+                    continuation.resume(throwing: TrackerError.connectionFailed)
+                }
+            }
+            timer.resume()
+
+            connection.send(content: request, completion: .contentProcessed { error in
+                if let error = error {
+                    if resumed.testAndSet() {
+                        timer.cancel()
+                        continuation.resume(throwing: error)
+                    }
+                    return
+                }
+                connection.receiveMessage { content, context, isComplete, error in
+                    if resumed.testAndSet() {
+                        timer.cancel()
+                        if let error = error {
+                            continuation.resume(throwing: error)
+                        } else if let data = content {
+                            continuation.resume(returning: data)
+                        } else {
+                            continuation.resume(throwing: TrackerError.invalidResponse)
+                        }
+                    }
+                }
+            })
         }
     }
 }
@@ -342,3 +267,21 @@ extension Data {
         return UInt64(bigEndian: value)
     }
 }
+
+private final class AtomicFlag: @unchecked Sendable {
+    private var value: Bool
+    private let lock = NSLock()
+
+    init(_ value: Bool) {
+        self.value = value
+    }
+
+    func testAndSet() -> Bool {
+        lock.withLock {
+            if value { return false }
+            value = true
+            return true
+        }
+    }
+}
+

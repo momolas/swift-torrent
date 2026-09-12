@@ -1,14 +1,16 @@
 import Foundation
-import NIOCore
-import NIOPosix
+import Network
 
-/// Manages a single peer TCP connection using SwiftNIO.
+/// Manages a single peer TCP connection using native Network.framework.
 public final class PeerConnection: @unchecked Sendable {
     public let address: String
     public let port: UInt16
 
-    private var _channel: Channel?
+    private var connection: NWConnection?
+    private var receiveTask: Task<Void, Never>?
     private let lock = NSLock()
+    private let queue = DispatchQueue(label: "org.swifttorrent.peerconnection", qos: .userInitiated)
+
     private let infoHash: Data
     private let peerID: Data
 
@@ -41,75 +43,186 @@ public final class PeerConnection: @unchecked Sendable {
         self.enableDHT = enableDHT
     }
 
-    private func setChannel(_ ch: Channel) {
+    public func connect(on group: Any? = nil) async throws {
+        let endpoint = NWEndpoint.hostPort(
+            host: NWEndpoint.Host(address),
+            port: NWEndpoint.Port(rawValue: port) ?? 6881
+        )
+        let tcpParams = NWParameters.tcp
+        let conn = NWConnection(to: endpoint, using: tcpParams)
+
         lock.withLock {
-            _channel = ch
+            self.connection = conn
         }
-    }
 
-    private func getChannel() -> Channel? {
-        lock.withLock {
-            _channel
-        }
-    }
+        // Wait for connection to be ready with 4-second timeout
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                try await Task.sleep(for: .seconds(4))
+                throw PeerConnectionError.handshakeTimeout
+            }
 
-    public func connect(on group: EventLoopGroup) async throws -> Channel {
-        let onMsg = self.onMessage
-        let onDisc = self.onDisconnect
-        let decoder = PeerMessageDecoder(expectedInfoHash: infoHash)
-
-        let bootstrap = ClientBootstrap(group: group)
-            .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
-            .connectTimeout(.seconds(4))
-            .channelInitializer { channel in
-                do {
-                    let decoderHandler = ByteToMessageHandler(decoder)
-                    let messageHandler = PeerMessageHandler(onMessage: onMsg, onDisconnect: onDisc)
-                    try channel.pipeline.syncOperations.addHandler(decoderHandler)
-                    try channel.pipeline.syncOperations.addHandler(messageHandler)
-                    return channel.eventLoop.makeSucceededVoidFuture()
-                } catch {
-                    return channel.eventLoop.makeFailedFuture(error)
+            group.addTask {
+                try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                    let resumed = AtomicFlag(false)
+                    conn.stateUpdateHandler = { state in
+                        switch state {
+                        case .ready:
+                            if resumed.testAndSet() {
+                                cont.resume()
+                            }
+                        case .failed(let err):
+                            if resumed.testAndSet() {
+                                cont.resume(throwing: err)
+                            }
+                        case .cancelled:
+                            if resumed.testAndSet() {
+                                cont.resume(throwing: PeerConnectionError.notConnected)
+                            }
+                        default:
+                            break
+                        }
+                    }
+                    conn.start(queue: self.queue)
                 }
             }
-        let ch = try await bootstrap.connect(host: address, port: Int(port)).get()
 
-        setChannel(ch)
+            try await group.next()
+            group.cancelAll()
+        }
 
-        // Send handshake as raw bytes (before the encoder is in the pipeline)
-        let reserved = Handshake.defaultReserved(
-            enableFastExtension: enableFastExtension,
-            enableDHT: enableDHT,
-            isPrivate: isPrivate
-        )
-        let handshake = Handshake(infoHash: infoHash, peerID: peerID, reserved: reserved)
-        var buffer = ch.allocator.buffer(capacity: Handshake.length)
-        buffer.writeBytes(handshake.encode())
-        try await ch.writeAndFlush(buffer).get()
+        // Perform handshake with 4-second timeout
+        var receiveBuffer = Data()
+        let handshakeResp: Handshake = try await withThrowingTaskGroup(of: Handshake.self) { group in
+            group.addTask {
+                try await Task.sleep(for: .seconds(4))
+                throw PeerConnectionError.handshakeTimeout
+            }
 
-        // Add the message encoder after handshake is sent
-        try await ch.pipeline.addHandler(PeerMessageEncoder()).get()
+            group.addTask {
+                let reserved = Handshake.defaultReserved(
+                    enableFastExtension: self.enableFastExtension,
+                    enableDHT: self.enableDHT,
+                    isPrivate: self.isPrivate
+                )
+                let handshake = Handshake(infoHash: self.infoHash, peerID: self.peerID, reserved: reserved)
+                let handshakeData = handshake.encode()
+                try await self.sendRaw(connection: conn, data: handshakeData)
 
-        // Wait for remote handshake with timeout
-        let remoteHandshake = try await decoder.waitForHandshake(timeout: .seconds(4))
-        self.remotePeerID = remoteHandshake.peerID
-        self.supportsExtensions = remoteHandshake.supportsExtensions
-        self.supportsFastExtension = enableFastExtension && remoteHandshake.supportsFastExtension
-        self.supportsDHT = enableDHT && !isPrivate && remoteHandshake.supportsDHT
+                let rawData = try await self.receiveExact(connection: conn, count: Handshake.length, buffer: &receiveBuffer)
+                guard let decoded = try? Handshake.decode(from: rawData) else {
+                    throw PeerConnectionError.handshakeFailed
+                }
+                if decoded.infoHash != self.infoHash {
+                    throw PeerConnectionError.handshakeFailed
+                }
+                return decoded
+            }
 
-        return ch
+            let first = try await group.next()!
+            group.cancelAll()
+            return first
+        }
+
+        self.remotePeerID = handshakeResp.peerID
+        self.supportsExtensions = handshakeResp.supportsExtensions
+        self.supportsFastExtension = self.enableFastExtension && handshakeResp.supportsFastExtension
+        self.supportsDHT = self.enableDHT && !self.isPrivate && handshakeResp.supportsDHT
+
+        // Start message receive loop
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await self.messageReceiveLoop(connection: conn, initialBuffer: receiveBuffer)
+        }
+        lock.withLock {
+            self.receiveTask = task
+        }
     }
 
     public func send(_ message: PeerMessage) async throws {
-        guard let ch = getChannel() else {
+        guard let conn = lock.withLock({ connection }) else {
             throw PeerConnectionError.notConnected
         }
-        try await ch.writeAndFlush(message).get()
+        let data = message.encode()
+        try await sendRaw(connection: conn, data: data)
     }
 
     public func close() async throws {
-        guard let ch = getChannel() else { return }
-        try await ch.close().get()
+        let (conn, task) = lock.withLock { () -> (NWConnection?, Task<Void, Never>?) in
+            let c = connection
+            let t = receiveTask
+            connection = nil
+            receiveTask = nil
+            return (c, t)
+        }
+        task?.cancel()
+        conn?.cancel()
+    }
+
+    // MARK: - Private Helpers
+
+    private func sendRaw(connection: NWConnection, data: Data) async throws {
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            connection.send(content: data, completion: .contentProcessed { error in
+                if let error {
+                    cont.resume(throwing: error)
+                } else {
+                    cont.resume()
+                }
+            })
+        }
+    }
+
+    private func receiveExact(connection: NWConnection, count: Int, buffer: inout Data) async throws -> Data {
+        while buffer.count < count {
+            let needed = count - buffer.count
+            let chunk = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
+                connection.receive(minimumIncompleteLength: 1, maximumLength: max(needed, 16384)) { data, _, isComplete, error in
+                    if let error {
+                        continuation.resume(throwing: error)
+                    } else if let data, !data.isEmpty {
+                        continuation.resume(returning: data)
+                    } else if isComplete {
+                        continuation.resume(throwing: PeerConnectionError.notConnected)
+                    } else {
+                        continuation.resume(throwing: PeerConnectionError.notConnected)
+                    }
+                }
+            }
+            buffer.append(chunk)
+        }
+        let result = buffer.prefix(count)
+        buffer.removeFirst(count)
+        return Data(result)
+    }
+
+    private func messageReceiveLoop(connection: NWConnection, initialBuffer: Data) async {
+        var buffer = initialBuffer
+        while !Task.isCancelled {
+            do {
+                let lengthData = try await receiveExact(connection: connection, count: 4, buffer: &buffer)
+                let length = lengthData.readUInt32BE(at: 0)
+
+                if length == 0 {
+                    onMessage?(.keepAlive)
+                    continue
+                }
+
+                // Safety limit: max message length 16MB
+                guard length <= 16 * 1024 * 1024 else {
+                    break
+                }
+
+                let payload = try await receiveExact(connection: connection, count: Int(length), buffer: &buffer)
+                let message = try PeerMessage.decode(from: payload)
+                onMessage?(message)
+            } catch {
+                break
+            }
+        }
+
+        connection.cancel()
+        onDisconnect?()
     }
 }
 
@@ -119,132 +232,19 @@ public enum PeerConnectionError: Error {
     case handshakeTimeout
 }
 
-// MARK: - NIO Channel Handlers
-
-/// Decodes peer wire protocol messages from byte stream.
-final class PeerMessageDecoder: ByteToMessageDecoder, @unchecked Sendable {
-    typealias InboundOut = PeerMessage
-
-    private let expectedInfoHash: Data?
-    private var handshakeReceived = false
-    var remotePeerID: Data?
-    var remoteSupportsExtensions: Bool = false
-
+private final class AtomicFlag: @unchecked Sendable {
+    private var value: Bool
     private let lock = NSLock()
-    private var handshakeContinuation: CheckedContinuation<Handshake, any Error>?
 
-    init(expectedInfoHash: Data? = nil) {
-        self.expectedInfoHash = expectedInfoHash
+    init(_ value: Bool) {
+        self.value = value
     }
 
-    func waitForHandshake(timeout: TimeAmount) async throws -> Handshake {
-        try await withCheckedThrowingContinuation { continuation in
-            let existingHandshake: Handshake? = lock.withLock {
-                if let remoteID = self.remotePeerID {
-                    let reserved = Data(count: 8)
-                    return Handshake(infoHash: self.expectedInfoHash ?? Data(count: 20), peerID: remoteID, reserved: reserved)
-                }
-                self.handshakeContinuation = continuation
-                return nil
-            }
-
-            if let existing = existingHandshake {
-                continuation.resume(returning: existing)
-                return
-            }
-
-            let seconds = Double(timeout.nanoseconds) / 1_000_000_000.0
-            Task {
-                try? await Task.sleep(for: .seconds(max(seconds, 1)))
-                let contToResume = self.lock.withLock { () -> (CheckedContinuation<Handshake, any Error>)? in
-                    guard let cont = self.handshakeContinuation else { return nil }
-                    self.handshakeContinuation = nil
-                    return cont
-                }
-                contToResume?.resume(throwing: PeerConnectionError.handshakeTimeout)
-            }
+    func testAndSet() -> Bool {
+        lock.withLock {
+            if value { return false }
+            value = true
+            return true
         }
-    }
-
-    func decode(context: ChannelHandlerContext, buffer: inout ByteBuffer) throws -> DecodingState {
-        if !handshakeReceived {
-            guard buffer.readableBytes >= Handshake.length else { return .needMoreData }
-            guard let bytes = buffer.readBytes(length: Handshake.length) else { return .needMoreData }
-            let handshake = try Handshake.decode(from: Data(bytes))
-
-            if let expected = expectedInfoHash, handshake.infoHash != expected {
-                throw PeerConnectionError.handshakeFailed
-            }
-
-            let cont = lock.withLock { () -> (CheckedContinuation<Handshake, any Error>)? in
-                remotePeerID = handshake.peerID
-                remoteSupportsExtensions = (handshake.reserved[5] & 0x10) != 0
-                handshakeReceived = true
-                let c = handshakeContinuation
-                handshakeContinuation = nil
-                return c
-            }
-
-            cont?.resume(returning: handshake)
-            return .continue
-        }
-
-        guard buffer.readableBytes >= 4 else { return .needMoreData }
-        let lengthBytes = buffer.getBytes(at: buffer.readerIndex, length: 4)!
-        let length = Data(lengthBytes).readUInt32BE(at: 0)
-
-        // Safety limit: max message length 16MB
-        guard length <= 16 * 1024 * 1024 else {
-            throw PeerMessageError.invalidPayload
-        }
-
-        if length == 0 {
-            buffer.moveReaderIndex(forwardBy: 4)
-            context.fireChannelRead(wrapInboundOut(.keepAlive))
-            return .continue
-        }
-
-        guard buffer.readableBytes >= 4 + Int(length) else { return .needMoreData }
-        buffer.moveReaderIndex(forwardBy: 4)
-        guard let payload = buffer.readBytes(length: Int(length)) else { return .needMoreData }
-        let message = try PeerMessage.decode(from: Data(payload))
-        context.fireChannelRead(wrapInboundOut(message))
-        return .continue
-    }
-}
-
-/// Receives decoded PeerMessage and calls the callback.
-final class PeerMessageHandler: ChannelInboundHandler, @unchecked Sendable {
-    typealias InboundIn = PeerMessage
-
-    private let onMessage: (@Sendable (PeerMessage) -> Void)?
-    private let onDisconnect: (@Sendable () -> Void)?
-
-    init(onMessage: (@Sendable (PeerMessage) -> Void)?, onDisconnect: (@Sendable () -> Void)?) {
-        self.onMessage = onMessage
-        self.onDisconnect = onDisconnect
-    }
-
-    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
-        let message = unwrapInboundIn(data)
-        onMessage?(message)
-    }
-
-    func channelInactive(context: ChannelHandlerContext) {
-        onDisconnect?()
-    }
-}
-
-/// Encodes PeerMessage to bytes.
-final class PeerMessageEncoder: ChannelOutboundHandler, @unchecked Sendable {
-    typealias OutboundIn = PeerMessage
-    typealias OutboundOut = ByteBuffer
-
-    func write(context: ChannelHandlerContext, data: NIOAny, promise: EventLoopPromise<Void>?) {
-        let message = unwrapOutboundIn(data)
-        let encoded = message.encode()
-        var buffer = context.channel.allocator.buffer(capacity: encoded.count)
-        buffer.writeBytes(encoded)
-        context.write(wrapOutboundOut(buffer), promise: promise)
     }
 }
